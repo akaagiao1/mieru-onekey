@@ -64,7 +64,13 @@ bash mieru-onekey.sh install --port 21000 --user alice --password '换成你的�
 
 装完客户端配置在 `/root/mieru-client.txt`（600 权限），同时打印到终端。
 
-重装 / 升级：再跑一次 `install` 会沿用 `/root/.mieru-onekey/state.env` 里的用户、密码、端口、域名、tag（显式参数优先），只换版本，不会悄悄换密码、让已发的 QuanX 配置失效。要换密码就传 `--password`，或先删 `state.env` 再跑。管理命令：
+国旗：生成的配置带国家符号，方便在 QuanX 里筛选——tag 前缀（如 `tag=🇺🇸-xiaoyin-01`）与客户端文件时间后（`# mieru 客户端配置（… UTC） 🇺🇸 US`）都有。不指定时按本机 IP 自动识别（先 ipinfo，再 ip-api）；GeoIP 可能不准（比如 HKG1 的 IP 在 ip-api 里显示 US，实际是香港），不准就用 `--country` 钉死：
+
+```bash
+bash mieru-onekey.sh install --country HK   # 或 MIERU_COUNTRY=HK
+```
+
+重装 / 升级：再跑一次 `install` 会沿用 `/root/.mieru-onekey/state.env` 里的用户、密码、端口、域名、tag、国家（显式参数优先），只换版本，不会悄悄换密码、让已发的 QuanX 配置失效。要换密码就传 `--password`，或先删 `state.env` 再跑。管理命令：
 
 ```bash
 bash mieru-onekey.sh show      # 再看一遍客户端配置
@@ -81,7 +87,8 @@ bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
 | `MIERU_PORT` | `8964` | 端口，1025–65535；指定后运行时不再问 |
 | `MIERU_USER` / `MIERU_PASS` | 随机 | 未指定密码时随机生成 20 位 |
 | `MIERU_HOST` | 自动探测 | 客户端填的地址，IP 或域名 |
-| `MIERU_TAG` | `mieru` | 节点名前缀，输出为 `mieru-01` |
+| `MIERU_TAG` | `mieru` | 节点名前缀，输出为 `mieru-01`（有国旗时为 `🇺🇸-mieru-01`） |
+| `MIERU_COUNTRY` | 自动识别 | 2 位 ISO 国家代码，如 `US` / `DE` / `HK`；指定后 tag 与时间后加国旗 |
 | `MIERU_VERSION` | `3.39.0` | mita 版本 |
 | `MIERU_ASK_PORT` | 跟随终端 | 设为 `1` 可在管道测试时强制提问；`0` 不问 |
 | `MIERU_DRY_RUN` | `0` | 设为 `1` 只生成配置自检，不装机、不下载 |
@@ -101,6 +108,7 @@ bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
 - Alpine：xiaoyin（3.21）、dv-us-lite（3.24），8964，`RUNNING`，TCP+UDP 监听，OpenRC 服务已加进 default 运行级
 - Alpine 坑点：`mita apply config` 要走 `/run/mita/mita.sock`，守护进程没跑时直接报错；新装的守护进程先是 `IDLE`（不监听），apply 之后必须再 `mita start` 才会切到 `RUNNING`。脚本已按 `rc-service mita start → mita stop → apply → mita start` 的顺序处理。
 - v1.2.1 修复（2026-11-23）：重装不再悄悄换密码（沿用 `state.env`，旧版无密码时从客户端文件找回，xiaoyin 真机重装验证配置行哈希不变）；`--port` 等缺值时干净报错，不再 `unbound variable` 崩掉；`restart` 时守护进程未跑不再半路退出；端口占用检查补了 UDP；纯 IPv6 机器自动探测 IPv6、客户端行加方括号；删掉从没用过的 `openssl` 硬依赖；`update` 显示已装版本。arm64 的 deb 已核实存在且二进制同样静态链接。
+- v1.2.2 国旗（2026-11-23）：`--country` / `MIERU_COUNTRY` 指定国家，tag 前缀与客户端文件时间后加国旗；不指定时按 IP 自动识别（ipinfo → ip-api）。GeoIP 可能不准：HKG1 的 IP 在 ip-api 里是 US、ipinfo 里是 HK，实际是香港，以 `--country HK` 为准；野草云两家分别是 SG / HK，城市信息显示香港，用 HK；IEPL 出口 IP 显示 HK，但那台是国内入口机，按 CN 钉死。
 
 沙箱里**没有**验证、须在真机上验证的：
 

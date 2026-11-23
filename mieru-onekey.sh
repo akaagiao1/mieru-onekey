@@ -12,6 +12,8 @@
 #   apk add --no-cache bash curl && bash mieru-onekey.sh install
 # - 重装沿用上次的用户/密码/端口/tag（存 /root/.mieru-onekey/state.env），
 #   显式参数优先；升版重装不会悄悄换密码、让已发的 QuanX 配置失效。
+# - 国旗：tag 前缀与客户端文件时间后都加国家符号（如 🇺🇸），方便筛选；
+#   未指定时按本机 IP 自动识别（ipinfo → ip-api），识别不准时用 --country 指定。
 #
 # 用法：
 #   bash mieru-onekey.sh install
@@ -23,7 +25,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 MITA_VERSION="${MIERU_VERSION:-3.39.0}"
 DRY_RUN="${MIERU_DRY_RUN:-0}"
 STATE_DIR="${MIERU_STATE_DIR:-/root/.mieru-onekey}"
@@ -56,6 +58,20 @@ valid_host() {
 }
 fmt_host() { # 客户端行里的 host：裸 IPv6 加方括号，其余原样
   if [[ $1 == *:* && $1 != \[* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+country_flag() { # 国家代码（US）→ 国旗（🇺🇸），区域指示符拼出来
+  python3 -c "import sys; print(''.join(chr(0x1F1E6 + ord(c) - 65) for c in sys.argv[1]))" "$1" 2>/dev/null || printf '%s' "$1"
+}
+detect_country() { # 按 IP 自动识别国家代码（$1=IP）；识别不到返回空串
+  local ip="$1" code=""
+  # 只认 IP（IPv4 或含 : 的 IPv6），不认域名
+  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $ip == *:* ]] || return 0
+  code="$(curl -fsSL --max-time 8 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d ' \r\n')" || true
+  if [[ ! $code =~ ^[A-Za-z]{2}$ ]]; then
+    # ipinfo 不行再试 ip-api（免费版只支持 http）
+    code="$(curl -fsSL --max-time 8 "http://ip-api.com/line/${ip}?fields=countryCode" 2>/dev/null | tr -d ' \r\n')" || true
+  fi
+  [[ $code =~ ^[A-Za-z]{2}$ ]] && printf '%s' "${code^^}" || true
 }
 is_cf_port() {
   case "$1" in
@@ -97,7 +113,8 @@ if [[ $CMD == --help || $CMD == -h || $CMD == help ]]; then
   printf '\n子命令：install | show | status | restart | uninstall | update\n'
   printf '端口：运行有终端时会问端口，回车用默认 8964；--port / MIERU_PORT 指定后不再问；\n'
   printf '      --no-ask-port 有终端也不问；MIERU_ASK_PORT=1 可在管道测试时强制提问。\n'
-  printf '环境变量：MIERU_USER / MIERU_PASS / MIERU_PORT / MIERU_HOST / MIERU_TAG / MIERU_VERSION / MIERU_DRY_RUN\n'
+  printf '环境变量：MIERU_USER / MIERU_PASS / MIERU_PORT / MIERU_HOST / MIERU_TAG / MIERU_COUNTRY / MIERU_VERSION / MIERU_DRY_RUN\n'
+  printf '国旗：--country US（2 位代码）指定国家，tag 前缀与客户端文件时间后加国旗；不指定时按 IP 自动识别。\n'
   exit 0
 fi
 shift || true
@@ -115,10 +132,13 @@ USER_EXPLICIT=0
 PASS_EXPLICIT=0
 HOST_EXPLICIT=0
 TAG_EXPLICIT=0
+COUNTRY_EXPLICIT=0
 [[ -n ${MIERU_USER:-} ]] && USER_EXPLICIT=1
 [[ -n ${MIERU_PASS:-} ]] && PASS_EXPLICIT=1
 [[ -n ${MIERU_HOST:-} ]] && HOST_EXPLICIT=1
 [[ -n ${MIERU_TAG:-} ]] && TAG_EXPLICIT=1
+COUNTRY="${MIERU_COUNTRY:-}"
+[[ -n ${MIERU_COUNTRY:-} ]] && COUNTRY_EXPLICIT=1
 
 while (( $# )); do
   case "$1" in
@@ -131,6 +151,7 @@ while (( $# )); do
     --password) [[ $# -ge 2 ]] || die "缺少参数值：--password"; USER_PASS="$2"; PASS_EXPLICIT=1; shift 2 ;;
     --host) [[ $# -ge 2 ]] || die "缺少参数值：--host"; HOST="$2"; HOST_EXPLICIT=1; shift 2 ;;
     --tag) [[ $# -ge 2 ]] || die "缺少参数值：--tag"; TAG="$2"; TAG_EXPLICIT=1; shift 2 ;;
+    --country) [[ $# -ge 2 ]] || die "缺少参数值：--country"; COUNTRY="$2"; COUNTRY_EXPLICIT=1; shift 2 ;;
     --ask-port) ASK_PORT=1; shift ;;
     --no-ask-port) ASK_PORT=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -181,6 +202,10 @@ validate() {
   if [[ -n $USER_NAME ]]; then valid_name "$USER_NAME" || die "用户名非法：只允许字母数字 _ . -，1-64 位。"; fi
   if [[ -n $USER_PASS ]]; then valid_pass "$USER_PASS" || die "密码非法：8-64 位，只允许字母数字与 _ ! @ # % ^ * + = . -。"; fi
   if [[ -n $HOST ]]; then valid_host "$HOST" || die "HOST 非法：$HOST，example.com 这类占位域名会被直接拒绝。"; fi
+  if [[ -n $COUNTRY ]]; then
+    [[ $COUNTRY =~ ^[A-Za-z]{2}$ ]] || die "国家代码非法：$COUNTRY，须为 2 位 ISO 代码，如 US / DE / HK。"
+    COUNTRY="${COUNTRY^^}"
+  fi
 }
 
 # ---------- 生成 mita 配置（python 写 JSON，避免手拼引号转义） ----------
@@ -262,7 +287,7 @@ do_install() {
   # 重装沿用上次的状态（用户/密码/端口/域名/tag），显式给的值优先；
   # 升版重装不会悄悄换密码、让已发的 QuanX 配置失效。
   if [[ $DRY_RUN != 1 && -f $STATE_DIR/state.env ]]; then
-    local keep_port="$PORT" keep_user="$USER_NAME" keep_pass="$USER_PASS" keep_host="$HOST" keep_tag="$TAG"
+    local keep_port="$PORT" keep_user="$USER_NAME" keep_pass="$USER_PASS" keep_host="$HOST" keep_tag="$TAG" keep_country="$COUNTRY"
     # shellcheck disable=SC1090
     . "$STATE_DIR/state.env"
     [[ $PORT_EXPLICIT == 1 ]] && PORT="$keep_port"
@@ -270,6 +295,7 @@ do_install() {
     [[ $PASS_EXPLICIT == 1 ]] && USER_PASS="$keep_pass"
     [[ $HOST_EXPLICIT == 1 ]] && HOST="$keep_host"
     [[ $TAG_EXPLICIT == 1 ]] && TAG="$keep_tag"
+    [[ $COUNTRY_EXPLICIT == 1 ]] && COUNTRY="$keep_country"
   fi
   # 旧版 state.env 里没有密码时，从客户端文件里找回（避免重装换密码）
   if [[ $DRY_RUN != 1 && $PASS_EXPLICIT != 1 && -z $USER_PASS && -f $CLIENT_FILE ]]; then
@@ -291,6 +317,13 @@ do_install() {
   fi
   # 自动探测的 HOST 之前没走过 validate，这里补上
   valid_host "$HOST" || die "HOST 非法：$HOST，请用 --host IP或域名 指定。"
+  # 国家：没指定就按 IP 自动识别（只认 IP；识别不到就不要国旗，不报错）
+  if [[ -z $COUNTRY && $DRY_RUN != 1 ]]; then
+    COUNTRY="$(detect_country "$HOST")"
+    [[ -n $COUNTRY ]] || warn "识别不到本机国家，生成的配置不带国旗；想指定请用 --country US（2 位代码）。"
+  fi
+  local flag=""
+  [[ -n $COUNTRY ]] && flag="$(country_flag "$COUNTRY")"
   local tag_base="${TAG:-mieru}"
   # arch/os 已在 do_install 开头探测（Alpine 依赖安装需要先知道 os）
 
@@ -379,13 +412,19 @@ do_install() {
     CLIENT_FILE="$workdir/mieru-client.txt"
   fi
   mkdir -p "$(dirname "$CLIENT_FILE")" 2>/dev/null || true
+  local tag_out="${tag_base}-01"
+  [[ -n $flag ]] && tag_out="${flag}-${tag_base}-01"
   {
-    printf '# mieru 客户端配置（%s）\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
+    if [[ -n $flag ]]; then
+      printf '# mieru 客户端配置（%s） %s %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')" "$flag" "$COUNTRY"
+    else
+      printf '# mieru 客户端配置（%s）\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
+    fi
     printf '# 服务端：%s\n' "$HOST"
     printf '# 凭据只在此文件，勿公开分享。\n\n'
     printf '## 明文（官方 mita，端口 %s）\n' "$PORT"
-    printf 'mieru=%s:%s, username=%s, password=%s, fast-open=false, udp-relay=true, udp-over-tcp=true, tag=%s-01\n\n' \
-      "$(fmt_host "$HOST")" "$PORT" "$USER_NAME" "$USER_PASS" "$tag_base"
+    printf 'mieru=%s:%s, username=%s, password=%s, fast-open=false, udp-relay=true, udp-over-tcp=true, tag=%s\n\n' \
+      "$(fmt_host "$HOST")" "$PORT" "$USER_NAME" "$USER_PASS" "$tag_out"
     printf '## 自查\n'
     printf '# mita status 应为 RUNNING；ss -tlnp | grep %s\n' "$PORT"
   } > "$CLIENT_FILE"
@@ -402,6 +441,7 @@ USER_NAME="$USER_NAME"
 USER_PASS="$USER_PASS"
 PORT="$PORT"
 TAG="$tag_base"
+COUNTRY="$COUNTRY"
 EOF
     chmod 600 "$STATE_DIR/state.env" || true
   fi
@@ -447,7 +487,7 @@ do_update() {
   else
     info "mita：未安装"
   fi
-  info "update：重新跑 install 会沿用 /root/.mieru-onekey/state.env 里的用户/密码/端口/tag（显式参数优先），只换版本。"
+  info "update：重新跑 install 会沿用 /root/.mieru-onekey/state.env 里的用户/密码/端口/tag/国家（显式参数优先），只换版本。"
   info "改版请用 MIERU_VERSION=xxx 再跑 install；要换密码请传 --password，或先删 state.env 再跑 install。"
 }
 
