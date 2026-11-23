@@ -13,7 +13,13 @@ mieru=203.0.113.10:8964, username=alice, password=你的密码, fast-open=false,
 ## 环境
 
 - Debian / Ubuntu / RHEL 系（Fedora / CentOS / Rocky / Alma），amd64 / arm64，root 运行
-- `mita` 只提供 deb / rpm，没有 Alpine 包
+- Alpine（v1.2.0 起）：`mita` 只提供 deb / rpm，没有 apk 包，但它是**静态链接二进制**，musl 的 Alpine 能直接跑。脚本从 deb 里只取 `/usr/bin/mita`，服务改走 OpenRC（`/etc/init.d/mita`，开机自启），其余逻辑与 Debian 一致。Alpine 上先装 bash 再跑脚本：
+  ```bash
+  apk add --no-cache bash curl
+  curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/mieru-onekey.sh -o mieru-onekey.sh
+  bash mieru-onekey.sh install
+  ```
+  脚本会在 Alpine 上自动补装解包依赖（GNU tar / xz / binutils）。
 - 系统时间必须同步：mieru 密钥由用户名 + 密码 + 系统时间推导，时钟偏差大直接连不上。脚本会看 `timedatectl` 提醒，未同步请先修 NTP
 
 ## 端口：运行时选
@@ -87,10 +93,15 @@ bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
 - mita JSON `python3 -m json.tool` 通过
 - 拒绝项均生效：`--mode 2`、`--tls-port` 等模式 2/3 参数直接报错；`example.com`、弱密码、非法端口直接报错
 
+真机已验证（2026-11-23）：
+
+- Debian 13：HKG1、192196、195587、gia-186143、dv-ge、dv-la-9929、IEPL，8964，`mita status` 为 `RUNNING`，TCP+UDP 监听
+- Alpine：xiaoyin（3.21）、dv-us-lite（3.24），8964，`RUNNING`，TCP+UDP 监听，OpenRC 服务已加进 default 运行级
+- Alpine 坑点：`mita apply config` 要走 `/run/mita/mita.sock`，守护进程没跑时直接报错；新装的守护进程先是 `IDLE`（不监听），apply 之后必须再 `mita start` 才会切到 `RUNNING`。脚本已按 `rc-service mita start → mita stop → apply → mita start` 的顺序处理。
+
 沙箱里**没有**验证、须在真机上验证的：
 
-1. VPS 上真装 `mita`，`mita status` 为 `RUNNING`，`ss -tlnp` 看到所选端口监听。
-2. QuanX 导入输出行，真机连通、能打开网页、UDP（视频/通话）正常。
+1. QuanX 导入输出行，真机连通、能打开网页、UDP（视频/通话）正常。
 
 ## 文件
 

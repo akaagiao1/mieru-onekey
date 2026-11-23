@@ -7,6 +7,9 @@
 # - 客户端凭据只保存在 /root/mieru-client.txt，勿公开分享。
 # - 端口运行可选：有终端时安装前会问端口，回车用默认 8964；
 #   已用 --port / MIERU_PORT 显式指定时不再问；管道/非终端时沿用默认，不卡住。
+# - Alpine 也支持：mita 是静态链接二进制，musl 上能直接跑；脚本从 deb 里只取
+#   二进制（不装 dpkg），服务改走 OpenRC。Alpine 上先装 bash 再跑脚本：
+#   apk add --no-cache bash curl && bash mieru-onekey.sh install
 #
 # 用法：
 #   bash mieru-onekey.sh install
@@ -18,7 +21,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 MITA_VERSION="${MIERU_VERSION:-3.39.0}"
 DRY_RUN="${MIERU_DRY_RUN:-0}"
 STATE_DIR="${MIERU_STATE_DIR:-/root/.mieru-onekey}"
@@ -180,17 +183,64 @@ PY
   python3 -m json.tool "$out" >/dev/null || die "mita 配置 JSON 生成失败：$out"
 }
 
+# ---------- Alpine 依赖与服务 ----------
+install_alpine_deps() {
+  # Alpine 自带 busybox tar 解不了 deb 里 data.tar.xz（缺 xz/ar），补 GNU tar/xz/binutils；
+  # 基础工具缺失时也一并补上。
+  info "Alpine：安装解包与运行依赖（tar/xz/binutils）..."
+  apk add --no-cache tar xz binutils || die "apk 安装依赖失败。"
+  local pkgs=()
+  command -v curl >/dev/null 2>&1 || pkgs+=(curl)
+  command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
+  command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
+  command -v ss >/dev/null 2>&1 || pkgs+=(iproute2)
+  if (( ${#pkgs[@]} )); then
+    apk add --no-cache "${pkgs[@]}" || die "apk 安装依赖失败：${pkgs[*]}"
+  fi
+}
+
+install_alpine_service() {
+  # 照抄 deb 的 systemd 服务含义：mita run 前台跑，mita 用户，/run/mita 归 mita 所有；
+  # 只是 init 从 systemd 换成 OpenRC。
+  cat > /etc/init.d/mita <<'INIT'
+#!/sbin/openrc-run
+name="mita"
+description="Mieru proxy server"
+command="/usr/bin/mita"
+command_args="run"
+command_user="mita:mita"
+pidfile="/run/mita/mita.pid"
+command_background=true
+start_pre() {
+    mkdir -p /run/mita
+    chown mita:mita /run/mita
+    chmod 775 /run/mita
+}
+depend() {
+    need net
+    after firewall
+}
+INIT
+  chmod +x /etc/init.d/mita
+  rc-update add mita default >/dev/null 2>&1 || warn "rc-update add mita default 失败，开机自启可能未生效，请手动检查。"
+}
+
 # ---------- 安装 ----------
 do_install() {
-  ask_port
-  validate
-  need_cmd curl; need_cmd python3; need_cmd openssl
+  local arch; arch="$(arch_name)"
+  local os; os="$(os_id)"
   if [[ $DRY_RUN == 1 ]]; then
     info "[dry-run] 不装机、不联网下载，只生成配置自检。"
   else
     [[ $(id -u) == 0 ]] || die "请以 root 运行此脚本（dry-run 除外）。"
-    [[ $(uname -s) == Linux ]] || die "需要 Linux（Debian / Ubuntu / RHEL 系）。"
+    [[ $(uname -s) == Linux ]] || die "需要 Linux（Debian / Ubuntu / RHEL 系 / Alpine）。"
+    if [[ $os == alpine ]]; then
+      install_alpine_deps
+    fi
   fi
+  ask_port
+  validate
+  need_cmd curl; need_cmd python3; need_cmd openssl
 
   # 用户名/密码：没给就生成，绝不回退到 name/pwd
   if [[ -z $USER_NAME ]]; then USER_NAME="mieru"; fi
@@ -203,8 +253,7 @@ do_install() {
     fi
   fi
   local tag_base="${TAG:-mieru}"
-  local arch; arch="$(arch_name)"
-  local os; os="$(os_id)"
+  # arch/os 已在 do_install 开头探测（Alpine 依赖安装需要先知道 os）
 
   # 时间同步提醒：mieru 密钥由用户名+密码+系统时间推导，时钟偏差大直接连不上
   if command -v timedatectl >/dev/null 2>&1 && [[ $DRY_RUN != 1 ]]; then
@@ -243,13 +292,43 @@ do_install() {
           || die "mita 下载失败：请检查版本号 $MITA_VERSION 与网络。"
         rpm -Uvh --force "$workdir/$rpm" || die "mita 安装失败（rpm）。"
         ;;
-      *) die "不支持的系统：$os，仅 Debian/Ubuntu/RHEL 系（mita 只提供 deb/rpm）。" ;;
+      alpine)
+        local deb="mita_${MITA_VERSION}_${arch}.deb"
+        curl -fSsL --retry 3 --connect-timeout 15 -o "$workdir/$deb" \
+          "https://github.com/enfein/mieru/releases/download/v${MITA_VERSION}/${deb}" \
+          || die "mita 下载失败：请检查版本号 $MITA_VERSION 与网络。"
+        # mita 是静态链接二进制，musl 的 Alpine 能直接跑；deb 里只有二进制与
+        # systemd 服务文件，这里只取二进制，服务改走 OpenRC。
+        (cd "$workdir" && ar x "$deb" data.tar.xz && tar -xf data.tar.xz ./usr/bin/mita) \
+          || die "mita 解包失败（ar/tar）。"
+        install -m 0755 "$workdir/usr/bin/mita" /usr/bin/mita
+        # 照抄 deb postinst：建 mita 用户与目录（Alpine 用 addgroup/adduser）
+        if ! id mita >/dev/null 2>&1; then
+          addgroup -S mita && adduser -S -G mita -H -s /sbin/nologin mita \
+            || die "创建 mita 用户失败。"
+        fi
+        mkdir -p /etc/mita /var/lib/mita /var/run/mita
+        chown -R mita:mita /etc/mita /var/lib/mita /var/run/mita
+        chmod 775 /etc/mita /var/lib/mita /var/run/mita
+        install_alpine_service
+        ;;
+      *) die "不支持的系统：$os，仅 Debian/Ubuntu/RHEL 系与 Alpine（mita 只提供 deb/rpm，Alpine 用 deb 解包）。" ;;
     esac
     command -v mita >/dev/null 2>&1 || die "mita 未装上（PATH 里找不到 mita）。"
     write_mita_config "$workdir/mita-plain.json" "$PORT" "$USER_NAME" "$USER_PASS"
-    mita stop >/dev/null 2>&1 || true
-    mita apply config "$workdir/mita-plain.json" || die "mita apply config 失败，请看上方报错改配置。"
-    mita start || die "mita start 失败。"
+    if [[ $os == alpine ]]; then
+      # Alpine 顺序不能照搬 Debian：mita apply config 要走 /run/mita/mita.sock，
+      # 守护进程没跑时直接报错；新装的守护进程先是 IDLE（不监听），apply 之后
+      # 必须再 mita start 才会切到 RUNNING 并监听（2026-11-23 xiaoyin 实测）。
+      rc-service mita start >/dev/null 2>&1 || true
+      mita stop >/dev/null 2>&1 || true
+      mita apply config "$workdir/mita-plain.json" || die "mita apply config 失败，请看上方报错改配置。"
+      mita start || die "mita start 失败。"
+    else
+      mita stop >/dev/null 2>&1 || true
+      mita apply config "$workdir/mita-plain.json" || die "mita apply config 失败，请看上方报错改配置。"
+      mita start || die "mita start 失败。"
+    fi
     sleep 2
     mita status | grep -q 'RUNNING' || die "mita 未进入 RUNNING：$(mita status 2>&1 | head -5)"
     info "mita 已 RUNNING，端口 $PORT（TCP+UDP）。"
@@ -298,7 +377,9 @@ do_status() {
   ss -tlnp 2>/dev/null | grep -E ":${PORT:-8964} " || true
 }
 do_restart() {
-  command -v mita >/dev/null 2>&1 && { mita stop; mita start; mita status; }
+  if [[ -f /etc/init.d/mita ]] && command -v rc-service >/dev/null 2>&1; then
+    rc-service mita restart; mita status
+  elif command -v mita >/dev/null 2>&1; then mita stop; mita start; mita status; fi
   info "已重启。"
 }
 do_uninstall() {
@@ -309,6 +390,13 @@ do_uninstall() {
   command -v mita >/dev/null 2>&1 && { mita stop || true; }
   if command -v dpkg >/dev/null 2>&1; then dpkg -r mita 2>/dev/null || true; fi
   if command -v rpm >/dev/null 2>&1; then rpm -e mita 2>/dev/null || true; fi
+  if [[ -f /etc/init.d/mita ]]; then
+    rc-service mita stop >/dev/null 2>&1 || true
+    rc-update del mita default >/dev/null 2>&1 || true
+    rm -f /etc/init.d/mita /usr/bin/mita
+    deluser mita >/dev/null 2>&1 || true
+    rm -rf /etc/mita /var/lib/mita
+  fi
   rm -f "$CLIENT_FILE"
   info "已卸载。"
 }
