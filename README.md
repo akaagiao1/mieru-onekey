@@ -62,7 +62,9 @@ bash mieru-onekey.sh install --port 21000 --user alice --password '换成你的�
 
 不填 `--host` 时自动探测公网 IP；也可以 `--host 你的域名或IP` 指定。`example.com` 这类占位域名会被直接拒绝；`name / pwd` 这类示例凭据也会被拒绝（密码须 8–64 位）。
 
-装完客户端配置在 `/root/mieru-client.txt`（600 权限），同时打印到终端。管理命令：
+装完客户端配置在 `/root/mieru-client.txt`（600 权限），同时打印到终端。
+
+重装 / 升级：再跑一次 `install` 会沿用 `/root/.mieru-onekey/state.env` 里的用户、密码、端口、域名、tag（显式参数优先），只换版本，不会悄悄换密码、让已发的 QuanX 配置失效。要换密码就传 `--password`，或先删 `state.env` 再跑。管理命令：
 
 ```bash
 bash mieru-onekey.sh show      # 再看一遍客户端配置
@@ -98,6 +100,7 @@ bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
 - Debian 13：HKG1、192196、195587、gia-186143、dv-ge、dv-la-9929、IEPL，8964，`mita status` 为 `RUNNING`，TCP+UDP 监听
 - Alpine：xiaoyin（3.21）、dv-us-lite（3.24），8964，`RUNNING`，TCP+UDP 监听，OpenRC 服务已加进 default 运行级
 - Alpine 坑点：`mita apply config` 要走 `/run/mita/mita.sock`，守护进程没跑时直接报错；新装的守护进程先是 `IDLE`（不监听），apply 之后必须再 `mita start` 才会切到 `RUNNING`。脚本已按 `rc-service mita start → mita stop → apply → mita start` 的顺序处理。
+- v1.2.1 修复（2026-11-23）：重装不再悄悄换密码（沿用 `state.env`，旧版无密码时从客户端文件找回，xiaoyin 真机重装验证配置行哈希不变）；`--port` 等缺值时干净报错，不再 `unbound variable` 崩掉；`restart` 时守护进程未跑不再半路退出；端口占用检查补了 UDP；纯 IPv6 机器自动探测 IPv6、客户端行加方括号；删掉从没用过的 `openssl` 硬依赖；`update` 显示已装版本。arm64 的 deb 已核实存在且二进制同样静态链接。
 
 沙箱里**没有**验证、须在真机上验证的：
 

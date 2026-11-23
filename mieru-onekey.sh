@@ -10,6 +10,8 @@
 # - Alpine 也支持：mita 是静态链接二进制，musl 上能直接跑；脚本从 deb 里只取
 #   二进制（不装 dpkg），服务改走 OpenRC。Alpine 上先装 bash 再跑脚本：
 #   apk add --no-cache bash curl && bash mieru-onekey.sh install
+# - 重装沿用上次的用户/密码/端口/tag（存 /root/.mieru-onekey/state.env），
+#   显式参数优先；升版重装不会悄悄换密码、让已发的 QuanX 配置失效。
 #
 # 用法：
 #   bash mieru-onekey.sh install
@@ -21,7 +23,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 MITA_VERSION="${MIERU_VERSION:-3.39.0}"
 DRY_RUN="${MIERU_DRY_RUN:-0}"
 STATE_DIR="${MIERU_STATE_DIR:-/root/.mieru-onekey}"
@@ -41,12 +43,19 @@ valid_port() { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1025 && $1 <= 65535 )); }
 valid_name() { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$ ]]; }
 valid_pass() { [[ $1 =~ ^[A-Za-z0-9_!@#%^*+=.-]{8,64}$ ]]; }
 valid_host() {
-  # 拒绝占位域名 example.com/org/net 及其子域；IP 或其他真实域名均可
+  # 拒绝占位域名 example.com/org/net 及其子域；IPv4、IPv6 或其他真实域名均可
   [[ -n $1 ]] || return 1
   case "$1" in
     example.com|example.org|example.net|*.example.com|*.example.org|*.example.net) return 1 ;;
   esac
+  # 已加方括号的 IPv6
+  [[ $1 =~ ^\[[0-9a-fA-F:]+\]$ ]] && return 0
+  # 裸 IPv6（含 :，无点）
+  [[ $1 == *:* && $1 != *.* ]] && [[ $1 =~ ^[0-9a-fA-F:]+$ ]] && return 0
   [[ $1 == *.* || $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+fmt_host() { # 客户端行里的 host：裸 IPv6 加方括号，其余原样
+  if [[ $1 == *:* && $1 != \[* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
 }
 is_cf_port() {
   case "$1" in
@@ -55,9 +64,12 @@ is_cf_port() {
   esac
 }
 public_ip() {
+  # 先 IPv4，纯 IPv6 的机器再试 IPv6
   local ip=""
   ip="$(curl -4fsSL --max-time 8 https://ifconfig.me 2>/dev/null | tr -d ' \r\n')" || true
   [[ -n $ip ]] || ip="$(curl -4fsSL --max-time 8 https://api.ipify.org 2>/dev/null | tr -d ' \r\n')" || true
+  [[ -n $ip ]] || ip="$(curl -6fsSL --max-time 8 https://ifconfig.me 2>/dev/null | tr -d ' \r\n')" || true
+  [[ -n $ip ]] || ip="$(curl -6fsSL --max-time 8 https://api.ipify.org 2>/dev/null | tr -d ' \r\n')" || true
   printf '%s' "$ip"
 }
 os_id() {
@@ -99,17 +111,26 @@ USER_NAME="${MIERU_USER:-}"
 USER_PASS="${MIERU_PASS:-}"
 HOST="${MIERU_HOST:-}"
 TAG="${MIERU_TAG:-}"
+USER_EXPLICIT=0
+PASS_EXPLICIT=0
+HOST_EXPLICIT=0
+TAG_EXPLICIT=0
+[[ -n ${MIERU_USER:-} ]] && USER_EXPLICIT=1
+[[ -n ${MIERU_PASS:-} ]] && PASS_EXPLICIT=1
+[[ -n ${MIERU_HOST:-} ]] && HOST_EXPLICIT=1
+[[ -n ${MIERU_TAG:-} ]] && TAG_EXPLICIT=1
 
 while (( $# )); do
   case "$1" in
     --mode|--modes)
+      [[ $# -ge 2 ]] || die "缺少参数值：--mode"
       [[ $2 == 1 ]] || die "模式 2/3 已去掉，本脚本只支持模式 1 明文（--mode 1）。"
       shift 2 ;;
-    --port) PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
-    --user) USER_NAME="$2"; shift 2 ;;
-    --password) USER_PASS="$2"; shift 2 ;;
-    --host) HOST="$2"; shift 2 ;;
-    --tag) TAG="$2"; shift 2 ;;
+    --port) [[ $# -ge 2 ]] || die "缺少参数值：--port"; PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
+    --user) [[ $# -ge 2 ]] || die "缺少参数值：--user"; USER_NAME="$2"; USER_EXPLICIT=1; shift 2 ;;
+    --password) [[ $# -ge 2 ]] || die "缺少参数值：--password"; USER_PASS="$2"; PASS_EXPLICIT=1; shift 2 ;;
+    --host) [[ $# -ge 2 ]] || die "缺少参数值：--host"; HOST="$2"; HOST_EXPLICIT=1; shift 2 ;;
+    --tag) [[ $# -ge 2 ]] || die "缺少参数值：--tag"; TAG="$2"; TAG_EXPLICIT=1; shift 2 ;;
     --ask-port) ASK_PORT=1; shift ;;
     --no-ask-port) ASK_PORT=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -140,7 +161,8 @@ ask_port() {
     if is_cf_port "$input"; then
       warn "端口 $input 是 Cloudflare 反代端口，直连 IP 时不建议用。"
     fi
-    if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ":${input} "; then
+    # mita 同时绑 TCP+UDP，只查 TCP 会漏掉只占 UDP 的情况
+    if command -v ss >/dev/null 2>&1 && { ss -tln 2>/dev/null | grep -q ":${input} " || ss -uln 2>/dev/null | grep -q ":${input} "; }; then
       warn "端口 $input 已被本机占用，请换一个。"
       attempts=$((attempts + 1)); continue
     fi
@@ -192,7 +214,6 @@ install_alpine_deps() {
   local pkgs=()
   command -v curl >/dev/null 2>&1 || pkgs+=(curl)
   command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
-  command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
   command -v ss >/dev/null 2>&1 || pkgs+=(iproute2)
   if (( ${#pkgs[@]} )); then
     apk add --no-cache "${pkgs[@]}" || die "apk 安装依赖失败：${pkgs[*]}"
@@ -238,9 +259,25 @@ do_install() {
       install_alpine_deps
     fi
   fi
+  # 重装沿用上次的状态（用户/密码/端口/域名/tag），显式给的值优先；
+  # 升版重装不会悄悄换密码、让已发的 QuanX 配置失效。
+  if [[ $DRY_RUN != 1 && -f $STATE_DIR/state.env ]]; then
+    local keep_port="$PORT" keep_user="$USER_NAME" keep_pass="$USER_PASS" keep_host="$HOST" keep_tag="$TAG"
+    # shellcheck disable=SC1090
+    . "$STATE_DIR/state.env"
+    [[ $PORT_EXPLICIT == 1 ]] && PORT="$keep_port"
+    [[ $USER_EXPLICIT == 1 ]] && USER_NAME="$keep_user"
+    [[ $PASS_EXPLICIT == 1 ]] && USER_PASS="$keep_pass"
+    [[ $HOST_EXPLICIT == 1 ]] && HOST="$keep_host"
+    [[ $TAG_EXPLICIT == 1 ]] && TAG="$keep_tag"
+  fi
+  # 旧版 state.env 里没有密码时，从客户端文件里找回（避免重装换密码）
+  if [[ $DRY_RUN != 1 && $PASS_EXPLICIT != 1 && -z $USER_PASS && -f $CLIENT_FILE ]]; then
+    USER_PASS="$(grep '^mieru=' "$CLIENT_FILE" 2>/dev/null | sed 's/.*password=\([^,]*\).*/\1/' | head -1 || true)"
+  fi
   ask_port
   validate
-  need_cmd curl; need_cmd python3; need_cmd openssl
+  need_cmd curl; need_cmd python3
 
   # 用户名/密码：没给就生成，绝不回退到 name/pwd
   if [[ -z $USER_NAME ]]; then USER_NAME="mieru"; fi
@@ -252,6 +289,8 @@ do_install() {
       [[ -n $HOST ]] || die "探测不到本机公网 IP，请用 --host IP或域名 指定。"
     fi
   fi
+  # 自动探测的 HOST 之前没走过 validate，这里补上
+  valid_host "$HOST" || die "HOST 非法：$HOST，请用 --host IP或域名 指定。"
   local tag_base="${TAG:-mieru}"
   # arch/os 已在 do_install 开头探测（Alpine 依赖安装需要先知道 os）
 
@@ -346,7 +385,7 @@ do_install() {
     printf '# 凭据只在此文件，勿公开分享。\n\n'
     printf '## 明文（官方 mita，端口 %s）\n' "$PORT"
     printf 'mieru=%s:%s, username=%s, password=%s, fast-open=false, udp-relay=true, udp-over-tcp=true, tag=%s-01\n\n' \
-      "$HOST" "$PORT" "$USER_NAME" "$USER_PASS" "$tag_base"
+      "$(fmt_host "$HOST")" "$PORT" "$USER_NAME" "$USER_PASS" "$tag_base"
     printf '## 自查\n'
     printf '# mita status 应为 RUNNING；ss -tlnp | grep %s\n' "$PORT"
   } > "$CLIENT_FILE"
@@ -356,9 +395,11 @@ do_install() {
   fi
   if [[ $DRY_RUN != 1 ]]; then
     mkdir -p "$STATE_DIR" 2>/dev/null || true
+    # 密码也存进 state.env（600），重装时沿用；各值字符集均不含 $ ` "，heredoc 安全
     cat > "$STATE_DIR/state.env" <<EOF
 HOST="$HOST"
 USER_NAME="$USER_NAME"
+USER_PASS="$USER_PASS"
 PORT="$PORT"
 TAG="$tag_base"
 EOF
@@ -379,7 +420,7 @@ do_status() {
 do_restart() {
   if [[ -f /etc/init.d/mita ]] && command -v rc-service >/dev/null 2>&1; then
     rc-service mita restart; mita status
-  elif command -v mita >/dev/null 2>&1; then mita stop; mita start; mita status; fi
+  elif command -v mita >/dev/null 2>&1; then mita stop || true; mita start; mita status; fi
   info "已重启。"
 }
 do_uninstall() {
@@ -401,8 +442,13 @@ do_uninstall() {
   info "已卸载。"
 }
 do_update() {
-  info "update：重新跑 install 会保留 /root/.mieru-onekey/state.env 里的用户与端口，只换版本。"
-  warn "当前版本：mita $MITA_VERSION；改版请用 MIERU_VERSION=xxx 再跑 install。"
+  if command -v mita >/dev/null 2>&1; then
+    info "已装 mita：$(mita version 2>/dev/null || echo 未知)"
+  else
+    info "mita：未安装"
+  fi
+  info "update：重新跑 install 会沿用 /root/.mieru-onekey/state.env 里的用户/密码/端口/tag（显式参数优先），只换版本。"
+  info "改版请用 MIERU_VERSION=xxx 再跑 install；要换密码请传 --password，或先删 state.env 再跑 install。"
 }
 
 case "$CMD" in
