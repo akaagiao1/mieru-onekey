@@ -1,13 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Volto v1.8.2 bootstrap. The upstream script verifies the release signature
+# Pinned Volto bootstrap. The upstream script verifies the release signature
 # and archive checksum before installing the requested or latest release.
 upstream_commit=e8dabe342be16d3071b43d0c8ba0477a226ace88
 upstream_sha256=b53abf79770c394022d608394d31b1f38c0800d15b7036e8d248cdaf17c2ea5a
 upstream_url="https://raw.githubusercontent.com/vcarus/volto/$upstream_commit/script/deploy.sh"
 deploy_root=${VOLTO_DEPLOY_ROOT:-}
 config="$deploy_root/etc/volto/config.toml"
+
+check_update_options() {
+  while (( $# )); do
+    case $1 in
+      --dry-run|--force|--enable-timer) shift ;;
+      -t|--tag)
+        if [[ $# -lt 2 || $2 == -* ]]; then
+          printf '%s\n' '请为 --tag 指定发布标签，例如 v1.8.3。' >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'HELP'
+升级已安装的 Volto
+  sudo bash volto-onekey.sh update
+  sudo bash volto-onekey.sh update --tag v1.8.3
+  sudo bash volto-onekey.sh update --dry-run --tag v1.8.3
+
+默认使用上游最新正式版并保留现有配置、证书和凭据。
+指定 --tag 后可用 --force 重装同版本。--enable-timer 会启用每日更新。
+HELP
+        exit 0
+        ;;
+      *)
+        printf 'update 不接受参数 %s，请用 update --help 查看用法。\n' "$1" >&2
+        exit 1
+        ;;
+    esac
+  done
+}
 
 should_prompt_for_port() {
   [[ -t 0 && ! -f "$config" ]] || return 1
@@ -139,7 +170,18 @@ enable_dual_stack() (
   return 1
 )
 
-if should_prompt_for_port "$@"; then
+update_only=false
+if [[ ${1:-} == update ]]; then
+  update_only=true
+  shift
+  check_update_options "$@"
+  if [[ ! -f $config ]]; then
+    printf '找不到 Volto 配置 %s。请先运行安装命令。\n' "$config" >&2
+    exit 1
+  fi
+elif [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  printf '%s\n\n' '已安装的 Volto 可用 sudo bash volto-onekey.sh update 升级。'
+elif should_prompt_for_port "$@"; then
   selected_port=$(choose_port)
   printf 'Volto 将使用 UDP %s。\n' "$selected_port" >&2
   set -- "$@" --port "$selected_port"
@@ -155,6 +197,16 @@ download_sha256=$(sha256sum < "$installer")
 if [[ "${download_sha256%% *}" != "$upstream_sha256" ]]; then
   printf '%s\n' 'Volto installer download failed SHA-256 verification.' >&2
   exit 1
+fi
+
+if [[ $update_only == true ]]; then
+  if [[ ! -f $config ]]; then
+    printf 'Volto 配置 %s 已移除，升级已停止。\n' "$config" >&2
+    exit 1
+  fi
+  # The timer needs a verified on-disk bootstrap even when no upgrade is due.
+  bash "$installer" "$@" </dev/null
+  exit 0
 fi
 
 first_install=false
