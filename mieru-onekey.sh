@@ -11,7 +11,7 @@
 #   二进制（不装 dpkg），服务改走 OpenRC。Alpine 上先装 bash 再跑脚本：
 #   apk add --no-cache bash curl && bash mieru-onekey.sh install
 # - 重装沿用上次的用户/密码/端口/tag（存 /root/.mieru-onekey/state.env），
-#   显式参数优先；升版重装不会悄悄换密码、让已发的 QuanX 配置失效。
+#   显式参数优先；只升级内核请用 update，保留现有配置文件。
 # - 国旗：tag 前缀与客户端文件时间后都加国家符号（如 🇺🇸），方便筛选；
 #   未指定时按本机 IP 自动识别（ipinfo → ip-api），识别不准时用 --country 指定。
 #
@@ -25,8 +25,8 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.2.2"
-MITA_VERSION="${MIERU_VERSION:-3.39.0}"
+VERSION="1.2.3"
+MITA_VERSION="${MIERU_VERSION:-3.40.0}"
 DRY_RUN="${MIERU_DRY_RUN:-0}"
 STATE_DIR="${MIERU_STATE_DIR:-/root/.mieru-onekey}"
 CLIENT_FILE="${MIERU_CLIENT_FILE:-/root/mieru-client.txt}"
@@ -111,6 +111,7 @@ if [[ $CMD == --help || $CMD == -h || $CMD == help ]]; then
   printf 'mieru-onekey %s\n' "$VERSION"
   sed -n '2,20p' "$0"
   printf '\n子命令：install | show | status | restart | uninstall | update\n'
+  printf '更新：update 只替换 mita 内核，可用 MIERU_VERSION 指定版本，--dry-run 预览。\n'
   printf '端口：运行有终端时会问端口，回车用默认 8964；--port / MIERU_PORT 指定后不再问；\n'
   printf '      --no-ask-port 有终端也不问；MIERU_ASK_PORT=1 可在管道测试时强制提问。\n'
   printf '环境变量：MIERU_USER / MIERU_PASS / MIERU_PORT / MIERU_HOST / MIERU_TAG / MIERU_COUNTRY / MIERU_VERSION / MIERU_DRY_RUN\n'
@@ -141,6 +142,9 @@ COUNTRY="${MIERU_COUNTRY:-}"
 [[ -n ${MIERU_COUNTRY:-} ]] && COUNTRY_EXPLICIT=1
 
 while (( $# )); do
+  if [[ $CMD == update && $1 != --dry-run && $1 != --help && $1 != -h ]]; then
+    die "update 不接受 $1。请用 MIERU_VERSION 指定内核版本。"
+  fi
   case "$1" in
     --mode|--modes)
       [[ $# -ge 2 ]] || die "缺少参数值：--mode"
@@ -176,7 +180,7 @@ ask_port() {
     input="$(printf '%s' "$input" | tr -d ' \t\r\n')"
     [[ -z $input ]] && return 0
     if ! valid_port "$input"; then
-      warn "端口无效：$input，须为 1025-65535。"
+      warn "端口无效：${input}，须为 1025-65535。"
       attempts=$((attempts + 1)); continue
     fi
     if is_cf_port "$input"; then
@@ -190,20 +194,20 @@ ask_port() {
     PORT="$input"
     return 0
   done
-  warn "连续 3 次输入无效，沿用默认端口 $PORT。"
+  warn "连续 3 次输入无效，沿用默认端口 ${PORT}。"
 }
 
 # ---------- 校验（装机前全部拦下，不装一半才报错） ----------
 validate() {
-  valid_port "$PORT" || die "端口非法：$PORT，须为 1025-65535。"
+  valid_port "$PORT" || die "端口非法：${PORT}，须为 1025-65535。"
   if is_cf_port "$PORT"; then
     warn "端口 $PORT 是 Cloudflare 反代端口，客户端直连 IP 时不建议用，仍继续请确认无 CF 在中间。"
   fi
   if [[ -n $USER_NAME ]]; then valid_name "$USER_NAME" || die "用户名非法：只允许字母数字 _ . -，1-64 位。"; fi
   if [[ -n $USER_PASS ]]; then valid_pass "$USER_PASS" || die "密码非法：8-64 位，只允许字母数字与 _ ! @ # % ^ * + = . -。"; fi
-  if [[ -n $HOST ]]; then valid_host "$HOST" || die "HOST 非法：$HOST，example.com 这类占位域名会被直接拒绝。"; fi
+  if [[ -n $HOST ]]; then valid_host "$HOST" || die "HOST 非法：${HOST}，example.com 这类占位域名会被直接拒绝。"; fi
   if [[ -n $COUNTRY ]]; then
-    [[ $COUNTRY =~ ^[A-Za-z]{2}$ ]] || die "国家代码非法：$COUNTRY，须为 2 位 ISO 代码，如 US / DE / HK。"
+    [[ $COUNTRY =~ ^[A-Za-z]{2}$ ]] || die "国家代码非法：${COUNTRY}，须为 2 位 ISO 代码，如 US / DE / HK。"
     COUNTRY="${COUNTRY^^}"
   fi
 }
@@ -316,7 +320,7 @@ do_install() {
     fi
   fi
   # 自动探测的 HOST 之前没走过 validate，这里补上
-  valid_host "$HOST" || die "HOST 非法：$HOST，请用 --host IP或域名 指定。"
+  valid_host "$HOST" || die "HOST 非法：${HOST}，请用 --host IP或域名 指定。"
   # 国家：没指定就按 IP 自动识别（只认 IP；识别不到就不要国旗，不报错）
   if [[ -z $COUNTRY && $DRY_RUN != 1 ]]; then
     COUNTRY="$(detect_country "$HOST")"
@@ -343,7 +347,7 @@ do_install() {
     trap 'rm -rf -- "${workdir:-}"' EXIT
   fi
 
-  info "安装 mita $MITA_VERSION（$os/$arch），端口 $PORT..."
+  info "安装 mita ${MITA_VERSION}（$os/${arch}），端口 $PORT..."
   if [[ $DRY_RUN == 1 ]]; then
     write_mita_config "$workdir/mita-plain.json" "$PORT" "$USER_NAME" "$USER_PASS"
     info "[dry-run] mita 配置已写 $workdir/mita-plain.json，JSON 校验通过。"
@@ -384,7 +388,7 @@ do_install() {
         chmod 775 /etc/mita /var/lib/mita /var/run/mita
         install_alpine_service
         ;;
-      *) die "不支持的系统：$os，仅 Debian/Ubuntu/RHEL 系与 Alpine（mita 只提供 deb/rpm，Alpine 用 deb 解包）。" ;;
+      *) die "不支持的系统：${os}，仅 Debian/Ubuntu/RHEL 系与 Alpine（mita 只提供 deb/rpm，Alpine 用 deb 解包）。" ;;
     esac
     command -v mita >/dev/null 2>&1 || die "mita 未装上（PATH 里找不到 mita）。"
     write_mita_config "$workdir/mita-plain.json" "$PORT" "$USER_NAME" "$USER_PASS"
@@ -403,7 +407,7 @@ do_install() {
     fi
     sleep 2
     mita status | grep -q 'RUNNING' || die "mita 未进入 RUNNING：$(mita status 2>&1 | head -5)"
-    info "mita 已 RUNNING，端口 $PORT（TCP+UDP）。"
+    info "mita 已 RUNNING，端口 ${PORT}（TCP+UDP）。"
   fi
 
   # ---- 输出客户端配置 ----
@@ -430,7 +434,7 @@ do_install() {
   } > "$CLIENT_FILE"
   chmod 600 "$CLIENT_FILE" || true
   if [[ $DRY_RUN == 1 ]]; then
-    info "[dry-run] 客户端配置已写 $CLIENT_FILE。"
+    info "[dry-run] 客户端配置已写 ${CLIENT_FILE}。"
   fi
   if [[ $DRY_RUN != 1 ]]; then
     mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -450,7 +454,7 @@ EOF
 }
 
 do_show() {
-  [[ -f $CLIENT_FILE ]] || die "没有客户端文件：$CLIENT_FILE，先跑 install。"
+  [[ -f $CLIENT_FILE ]] || die "没有客户端文件：${CLIENT_FILE}，先跑 install。"
   cat "$CLIENT_FILE"
 }
 do_status() {
@@ -481,14 +485,123 @@ do_uninstall() {
   rm -f "$CLIENT_FILE"
   info "已卸载。"
 }
+mita_binary_version() {
+  local output
+  output=$("$1" version 2>&1) || return 1
+  [[ $output =~ (^|[[:space:]])v?([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[2]}"
+}
+
+wait_for_mita_running() {
+  local binary="$1" health attempt
+  for (( attempt = 0; attempt < 10; attempt++ )); do
+    if health=$("$binary" status 2>&1) && [[ $health == *'"RUNNING"'* ]]; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
 do_update() {
-  if command -v mita >/dev/null 2>&1; then
-    info "已装 mita：$(mita version 2>/dev/null || echo 未知)"
-  else
-    info "mita：未安装"
+  local binary=/usr/bin/mita
+  local installed arch os archive url checksum health exit_code
+  local staging candidate backup
+  local restart_service=false replacing=false idle=false
+  local -a service_status service_restart
+
+  [[ $MITA_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "内核版本无效：${MITA_VERSION}（格式为 x.y.z）。"
+  if [[ $DRY_RUN == 1 ]]; then
+    info "[dry-run] 目标 mita 内核为 ${MITA_VERSION}。"
+    return 0
   fi
-  info "update：重新跑 install 会沿用 /root/.mieru-onekey/state.env 里的用户/密码/端口/tag/国家（显式参数优先），只换版本。"
-  info "改版请用 MIERU_VERSION=xxx 再跑 install；要换密码请传 --password，或先删 state.env 再跑 install。"
+  [[ $(uname -s) == Linux && $(id -u) == 0 ]] || die "请在 Linux 上以 root 运行 update。"
+  [[ -f $binary && -x $binary && ! -L $binary ]] || die "找不到已安装的 mita 内核：${binary}。"
+  arch=$(arch_name)
+  os=$(os_id)
+  case "$os" in
+    alpine)
+      need_cmd rc-service
+      service_status=(rc-service mita status)
+      service_restart=(rc-service mita restart)
+      ;;
+    debian|ubuntu|fedora|centos|rhel|rocky|almalinux)
+      need_cmd systemctl
+      service_status=(systemctl is-active --quiet mita.service)
+      service_restart=(systemctl restart mita.service)
+      ;;
+    *) die "不支持的系统：${os}。" ;;
+  esac
+
+  staging="$binary.update"
+  mkdir -m 700 -- "$staging" || die "无法创建升级目录 ${staging}。请检查是否已有升级在运行。"
+  candidate="$staging/mita.new"
+  backup="$staging/mita.old"
+  # Keep the trap in the command's own shell and exit while its state is in scope.
+  trap '
+    exit_code=$?
+    trap "" HUP INT TERM
+    if [[ $replacing == true && ! -e $candidate ]]; then
+      if ! mv -f -- "$backup" "$binary"; then
+        warn "恢复原内核失败，备份位于 ${backup}。"
+        exit 1
+      fi
+      warn "升级未完成，已恢复 mita ${installed}。"
+      if [[ $restart_service == true ]]; then
+        if ! "${service_restart[@]}" || ! wait_for_mita_running "$binary"; then
+          warn "原内核已恢复，请检查 mita 服务的启动日志。"
+        fi
+      fi
+    fi
+    rm -rf -- "$staging"
+    exit "$exit_code"
+  ' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  installed=$(mita_binary_version "$binary") || die "无法读取已安装的 mita 版本。"
+  if [[ $installed == "$MITA_VERSION" ]] ||
+     [[ -z ${MIERU_VERSION:-} && $(printf '%s\n' "$installed" "$MITA_VERSION" | sort -V | tail -n 1) == "$installed" ]]; then
+    info "当前 mita $installed 已达到目标版本 ${MITA_VERSION}。"
+    exit 0
+  fi
+
+  need_cmd curl
+  need_cmd sha256sum
+  need_cmd tar
+  archive="mita_${MITA_VERSION}_linux_${arch}.tar.gz"
+  url="https://github.com/enfein/mieru/releases/download/v$MITA_VERSION/$archive"
+  curl --proto '=https' -fSsL --retry 3 --connect-timeout 15 -o "$staging/$archive" "$url" ||
+    die "mita $MITA_VERSION 内核下载失败。"
+  curl --proto '=https' -fSsL --retry 3 --connect-timeout 15 -o "$staging/checksum" "$url.sha256.txt" ||
+    die "mita $MITA_VERSION 校验文件下载失败。"
+  checksum=$(awk 'NR == 1 { print $1; exit }' "$staging/checksum")
+  [[ $checksum =~ ^[0-9a-fA-F]{64}$ ]] || die "上游 SHA-256 校验文件格式错误。"
+  (cd "$staging" && printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c -) ||
+    die "mita 内核 SHA-256 校验失败。"
+
+  cp -p -- "$binary" "$candidate"
+  tar -xOzf "$staging/$archive" mita > "$candidate" || die "解包 mita 内核失败。"
+  [[ $(mita_binary_version "$candidate") == "$MITA_VERSION" ]] || die "新内核不可运行或版本不符。"
+  if "${service_status[@]}" >/dev/null 2>&1; then
+    # Restarting an IDLE daemon would start its saved proxy listeners.
+    if health=$("$binary" status 2>&1) && [[ $health == *'"IDLE"'* ]]; then
+      idle=true
+    else
+      restart_service=true
+    fi
+  fi
+  ln -- "$binary" "$backup"
+  replacing=true
+  mv -f -- "$candidate" "$binary"
+  if command -v restorecon >/dev/null 2>&1; then restorecon "$binary"; fi
+  if [[ $restart_service == true ]]; then
+    "${service_restart[@]}" || die "新内核启动失败。"
+    wait_for_mita_running "$binary" || die "新内核未进入 RUNNING。"
+  fi
+  replacing=false
+  info "mita 已从 $installed 更新到 ${MITA_VERSION}。"
+  if [[ $idle == true ]]; then info "代理保持 IDLE，守护进程下次重启时加载新内核。"; fi
+  exit 0
 }
 
 case "$CMD" in
@@ -498,5 +611,5 @@ case "$CMD" in
   restart) do_restart ;;
   uninstall) do_uninstall ;;
   update) do_update ;;
-  *) die "未知子命令：$CMD，用 bash $0 help 查看。" ;;
+  *) die "未知子命令：${CMD}，用 bash $0 help 查看。" ;;
 esac

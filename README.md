@@ -92,14 +92,18 @@ bash mieru-onekey.sh install --port 21000 --user alice --password '换成你的�
 bash mieru-onekey.sh install --country HK   # 或 MIERU_COUNTRY=HK
 ```
 
-重装 / 升级：再跑一次 `install` 会沿用 `/root/.mieru-onekey/state.env` 里的用户、密码、端口、域名、tag、国家（显式参数优先），只换版本，不会悄悄换密码、让已发的 QuanX 配置失效。要换密码就传 `--password`，或先删 `state.env` 再跑。管理命令：
+只升级内核时，运行 `sudo bash mieru-onekey.sh update`。脚本下载并校验官方 mita 二进制，保留服务端配置、`/root/.mieru-onekey/state.env` 与客户端文件。`RUNNING` 的代理会短暂重启，验证失败会恢复旧内核。已停止或处于 `IDLE` 的代理保持原状态，下次启动或重启守护进程时加载新内核。可先用 `update --dry-run` 查看目标版本。
+
+默认更新到 **3.40.0**。可用 `MIERU_VERSION` 显式指定目标版本。此命令独立替换 mita 二进制，系统包管理器仍显示原安装包的版本，之后安装系统包时可能覆盖该二进制。可用 `mita version` 查看实际内核版本。
+
+需要重新生成配置时，再跑 `install`。重装会沿用 `/root/.mieru-onekey/state.env` 里的用户、密码、端口、域名、tag 和国家，显式参数优先。需要换密码时传 `--password`。管理命令：
 
 ```bash
 bash mieru-onekey.sh show      # 再看一遍客户端配置
 bash mieru-onekey.sh status    # mita status
 bash mieru-onekey.sh restart
 bash mieru-onekey.sh uninstall # 输入 yes 才执行
-bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
+bash mieru-onekey.sh update    # 只更新内核，保留配置和凭据
 ```
 
 ## 环境变量（与命令行参数等价）
@@ -111,7 +115,7 @@ bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
 | `MIERU_HOST` | 自动探测 | 客户端填的地址，IP 或域名 |
 | `MIERU_TAG` | `mieru` | 节点名前缀，输出为 `mieru-01`（有国旗时为 `🇺🇸-mieru-01`） |
 | `MIERU_COUNTRY` | 自动识别 | 2 位 ISO 国家代码，如 `US` / `DE` / `HK`；指定后 tag 与时间后加国旗 |
-| `MIERU_VERSION` | `3.39.0` | mita 版本 |
+| `MIERU_VERSION` | `3.40.0` | 安装或更新时使用的 mita 版本 |
 | `MIERU_ASK_PORT` | 跟随终端 | 设为 `1` 可在管道测试时强制提问；`0` 不问 |
 | `MIERU_DRY_RUN` | `0` | 设为 `1` 只生成配置自检，不装机、不下载 |
 
