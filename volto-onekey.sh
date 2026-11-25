@@ -6,9 +6,11 @@ set -euo pipefail
 upstream_commit=e8dabe342be16d3071b43d0c8ba0477a226ace88
 upstream_sha256=b53abf79770c394022d608394d31b1f38c0800d15b7036e8d248cdaf17c2ea5a
 upstream_url="https://raw.githubusercontent.com/vcarus/volto/$upstream_commit/script/deploy.sh"
+deploy_root=${VOLTO_DEPLOY_ROOT:-}
+config="$deploy_root/etc/volto/config.toml"
 
 should_prompt_for_port() {
-  [[ -t 0 && ! -f "${VOLTO_DEPLOY_ROOT:-}/etc/volto/config.toml" ]] || return 1
+  [[ -t 0 && ! -f "$config" ]] || return 1
 
   # Let upstream handle explicit ports, informational commands and bad options.
   while (( $# )); do
@@ -74,6 +76,69 @@ choose_port() {
   done
 }
 
+enable_dual_stack() (
+  local binary="$deploy_root/usr/local/bin/volto"
+  local addresses help port temp_dir candidate backup sockets status
+  local replacing=false
+
+  [[ $(sysctl -n net.ipv6.bindv6only 2>/dev/null) == 0 ]] || return 0
+  addresses=$(ip -6 -o addr show scope global 2>/dev/null) || return 0
+  [[ -n $addresses ]] || return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  command -v ss >/dev/null 2>&1 || return 0
+  help=$("$binary" --help 2>&1) || return 0
+  [[ $help == *--check-config* ]] || return 0
+
+  # Serialize the listener change with Volto's installer and upgrade timer.
+  exec 9>>"$deploy_root/run/volto-deploy.lock"
+  flock -x 9
+  [[ -f $config && ! -L $config ]] || return 0
+  port=$(sed -nE 's/^listen = "0\.0\.0\.0:([0-9]+)"$/\1/p' "$config")
+  [[ $port =~ ^[0-9]+$ ]] || return 0
+
+  temp_dir=$(mktemp -d -- "${config%/*}/.volto-listen.XXXXXX")
+  candidate="$temp_dir/config.toml"
+  backup="$temp_dir/original.toml"
+  # Keep the IPv4 config until the replacement listener has been verified.
+  trap '
+    status=$?
+    trap "" HUP INT TERM
+    if [[ $replacing == true && ! -e $candidate ]]; then
+      if ! mv -f -- "$backup" "$config"; then
+        printf "无法恢复 Volto 原配置。备份位于 %s。\n" "$backup" >&2
+        exit 1
+      fi
+      if systemctl restart volto && systemctl is-active --quiet volto; then
+        printf "%s\n" "Volto 双栈切换未完成，已恢复 IPv4 监听。" >&2
+      else
+        printf "%s\n" "已恢复 Volto 原配置，但服务重启失败。" >&2
+      fi
+    fi
+    rm -rf -- "$temp_dir"
+    exit "$status"
+  ' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  cp -p -- "$config" "$backup"
+  cp -p -- "$config" "$candidate"
+  sed "s/^listen = \"0\.0\.0\.0:$port\"$/listen = \"[::]:$port\"/" "$config" > "$candidate"
+  "$binary" --check-config --config "$candidate"
+  replacing=true
+  mv -f -- "$candidate" "$config"
+
+  if systemctl restart volto && sleep 3 && systemctl is-active --quiet volto &&
+      sockets=$(ss -H -6 -lunpe "sport = :$port") &&
+      grep -Eq '"volto".*v6only:0([[:space:]]|$)' <<<"$sockets"; then
+    replacing=false
+    printf 'Volto 双栈监听已启用（IPv4 和 IPv6，UDP %s）。\n' "$port"
+    return 0
+  fi
+
+  return 1
+)
+
 if should_prompt_for_port "$@"; then
   selected_port=$(choose_port)
   printf 'Volto 将使用 UDP %s。\n' "$selected_port" >&2
@@ -92,6 +157,14 @@ if [[ "${download_sha256%% *}" != "$upstream_sha256" ]]; then
   exit 1
 fi
 
+first_install=false
+if [[ ! -e $config && ! -L $config ]]; then
+  first_install=true
+fi
+
 # Match the upstream bootstrap's stdin invocation and keep stdout attached
 # to the terminal so the upstream installer can display the Surge password.
 bash -s -- "$@" < "$installer"
+if [[ $first_install == true && -f $config ]]; then
+  enable_dual_stack
+fi
