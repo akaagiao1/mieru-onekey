@@ -10,7 +10,21 @@
 mieru=203.0.113.10:8964, username=alice, password=你的密码, fast-open=false, udp-relay=true, udp-over-tcp=true, tag=mieru-01
 ```
 
-## 环境
+## Volto 一键安装（Surge MASQUE）
+
+在 Debian / Ubuntu 的 systemd VPS 上运行，支持 amd64 和 arm64。需要 `curl`、`tar`、`sha256sum`、`ssh-keygen` 和 `openssl`。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/volto-onekey.sh -o volto-onekey.sh && sudo bash volto-onekey.sh
+```
+
+首次安装默认使用 UDP 443、用户名 `surge`、随机密码和自签名证书。要换端口或用户名，运行 `sudo bash volto-onekey.sh --port 2443 --username alice`。按实际端口放行 VPS 安全组和防火墙的 UDP 入站。需要每日自动更新时，在安装命令后加 `--enable-timer`。
+
+安装完成后，把终端输出中 `volto = masque, ...` 的整行粘到 Surge 配置的 `[Proxy]` 段，保留证书 SHA-256 指纹，再把 `volto` 加到你使用的策略组。节点行含密码，请保存在自己的 Surge 配置中。需要 Surge iOS 5.22.0 或 macOS 6.9.0 及以上版本。[Surge MASQUE 文档](https://manual.nssurge.com/policies/masque.html)
+
+脚本校验固定提交的上游安装器，再由上游安装器校验发布包签名和校验和。更多参数可运行 `bash volto-onekey.sh --help` 查看。[Volto 部署文档](https://github.com/vcarus/volto/blob/v1.8.2/docs/deployment.md#deploying-from-releases)
+
+## mieru 环境
 
 - Debian / Ubuntu / RHEL 系（Fedora / CentOS / Rocky / Alma），amd64 / arm64，root 运行
 - Alpine（v1.2.0 起）：`mita` 只提供 deb / rpm，没有 apk 包，但它是**静态链接二进制**，musl 的 Alpine 能直接跑。脚本从 deb 里只取 `/usr/bin/mita`，服务改走 OpenRC（`/etc/init.d/mita`，开机自启），其余逻辑与 Debian 一致。Alpine 上先装 bash 再跑脚本：
@@ -116,5 +130,5 @@ bash mieru-onekey.sh update    # 提示换版方式，配置与凭据保留
 
 ## 文件
 
-- `mieru-onekey.sh`：唯一脚本，独立文件，未并入其他仓库
-- 本目录即交付物；推 GitHub / 装到哪台 VPS，由你定，我再动手
+- `mieru-onekey.sh` 安装官方 `mita`，输出 Quantumult X 配置
+- `volto-onekey.sh` 安装 Volto，输出 Surge MASQUE 配置
