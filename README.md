@@ -12,13 +12,21 @@ mieru=203.0.113.10:8964, username=alice, password=你的密码, fast-open=false,
 
 ## Volto 一键安装（Surge MASQUE）
 
-在 Debian / Ubuntu 的 systemd VPS 上运行，支持 amd64 和 arm64。需要 `curl`、`tar`、`sha256sum`、`ssh-keygen` 和 `openssl`。
+在 Debian / Ubuntu 的 systemd VPS 上运行，支持 amd64 和 arm64。需要 `curl`、`tar`、`sha256sum`、`ssh-keygen` 和 `openssl`。交互检查端口使用 `iproute2` 提供的 `ss`。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/volto-onekey.sh -o volto-onekey.sh && sudo bash volto-onekey.sh
 ```
 
-首次安装默认使用 UDP 443、用户名 `surge`、随机密码和自签名证书。要换端口或用户名，运行 `sudo bash volto-onekey.sh --port 2443 --username alice`。按实际端口放行 VPS 安全组和防火墙的 UDP 入站。需要每日自动更新时，在安装命令后加 `--enable-timer`。
+首次在终端安装时会提示选择 UDP 端口。
+
+- 回车使用默认的 `443`。
+- 输入端口号自定义。选中的端口已被占用时，脚本会请你重选。
+- 输入 `r`，脚本会在 `20000–29999` 里随机试选当前空闲的 UDP 端口。
+
+用 `sudo bash volto-onekey.sh --port 2443 --username alice` 可直接指定端口和用户名。非交互首次安装默认使用 UDP `443`，升级沿用已有端口。默认用户名为 `surge`，安装器会生成随机密码和自签名证书。
+
+按实际端口放行 VPS 安全组和防火墙的 UDP 入站。需要每日自动更新时，在安装命令后加 `--enable-timer`。
 
 安装完成后，把终端输出中 `volto = masque, ...` 的整行粘到 Surge 配置的 `[Proxy]` 段，保留证书 SHA-256 指纹，再把 `volto` 加到你使用的策略组。节点行含密码，请保存在自己的 Surge 配置中。需要 Surge iOS 5.22.0 或 macOS 6.9.0 及以上版本。[Surge MASQUE 文档](https://manual.nssurge.com/policies/masque.html)
 
