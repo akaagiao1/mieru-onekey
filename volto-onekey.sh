@@ -9,23 +9,39 @@ upstream_url="https://raw.githubusercontent.com/vcarus/volto/$upstream_commit/sc
 deploy_root=${VOLTO_DEPLOY_ROOT:-}
 config="$deploy_root/etc/volto/config.toml"
 
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf '缺少必需命令 %s，请先安装。\n' "$1" >&2
+    exit 1
+  fi
+}
+
 check_update_options() {
+  local has_tag=false need_tag_flag=""
+  if [[ -n ${TAG:-} ]]; then
+    has_tag=true
+  fi
   while (( $# )); do
     case $1 in
-      --dry-run|--force|--enable-timer) shift ;;
+      --enable-timer) shift ;;
+      --dry-run|--force)
+        need_tag_flag="$1"
+        shift
+        ;;
       -t|--tag)
-        if [[ $# -lt 2 || $2 == -* ]]; then
-          printf '%s\n' '请为 --tag 指定发布标签，例如 v1.8.3。' >&2
+        if [[ $# -lt 2 || -z $2 || $2 == -* || $2 != v[0-9]* ]]; then
+          printf '%s\n' '请为 --tag 指定发布标签，例如 v1.8.5。' >&2
           exit 1
         fi
+        has_tag=true
         shift 2
         ;;
       -h|--help)
         cat <<'HELP'
 升级已安装的 Volto
   sudo bash volto-onekey.sh update
-  sudo bash volto-onekey.sh update --tag v1.8.3
-  sudo bash volto-onekey.sh update --dry-run --tag v1.8.3
+  sudo bash volto-onekey.sh update --tag v1.8.5
+  sudo bash volto-onekey.sh update --dry-run --tag v1.8.5
 
 默认使用上游最新正式版并保留现有配置、证书和凭据。
 指定 --tag 后可用 --force 重装同版本。--enable-timer 会启用每日更新。
@@ -38,10 +54,29 @@ HELP
         ;;
     esac
   done
+  if [[ -n $need_tag_flag && $has_tag != true ]]; then
+    printf 'update %s 需要配合 --tag 指定发布标签，例如 --tag v1.8.5。\n' "$need_tag_flag" >&2
+    exit 1
+  fi
+}
+
+check_config_for_update() {
+  local missing_msg="$1"
+  if [[ -f $config ]]; then
+    return 0
+  fi
+  if [[ -d ${config%/*} && ! -x ${config%/*} ]]; then
+    printf '无法访问 Volto 配置 %s，请使用 sudo 或以 root 运行。\n' "$config" >&2
+  else
+    printf '%s\n' "$missing_msg" >&2
+  fi
+  exit 1
 }
 
 should_prompt_for_port() {
-  [[ -t 0 && ! -f "$config" ]] || return 1
+  [[ -t 0 && -z ${PORT:-} && ! -f "$config" ]] || return 1
+  # If /etc/volto exists but is unreadable (0750 root:volto), avoid falsely treating as fresh install.
+  [[ ! -d ${config%/*} || -x ${config%/*} ]] || return 1
 
   # Let upstream handle explicit ports, informational commands and bad options.
   while (( $# )); do
@@ -78,6 +113,7 @@ choose_port() {
       printf '\n%s\n' '端口选择已取消。' >&2
       return 1
     fi
+    choice=$(printf '%s' "$choice" | tr -d ' \t\r\n')
 
     case $choice in
       '') choice=443 ;;
@@ -139,6 +175,7 @@ enable_dual_stack() (
         printf "无法恢复 Volto 原配置。备份位于 %s。\n" "$backup" >&2
         exit 1
       fi
+      systemctl reset-failed volto >/dev/null 2>&1 || true
       if systemctl restart volto && systemctl is-active --quiet volto; then
         printf "%s\n" "Volto 双栈切换未完成，已恢复 IPv4 监听。" >&2
       else
@@ -155,7 +192,7 @@ enable_dual_stack() (
   cp -p -- "$config" "$backup"
   cp -p -- "$config" "$candidate"
   sed "s/^listen = \"0\.0\.0\.0:$port\"$/listen = \"[::]:$port\"/" "$config" > "$candidate"
-  "$binary" --check-config --config "$candidate"
+  (unset RUST_LOG; "$binary" --check-config --config "$candidate")
   replacing=true
   mv -f -- "$candidate" "$config"
 
@@ -175,10 +212,7 @@ if [[ ${1:-} == update ]]; then
   update_only=true
   shift
   check_update_options "$@"
-  if [[ ! -f $config ]]; then
-    printf '找不到 Volto 配置 %s。请先运行安装命令。\n' "$config" >&2
-    exit 1
-  fi
+  check_config_for_update "找不到 Volto 配置 ${config}。请先运行安装命令。"
 elif [[ ${1:-} == --help || ${1:-} == -h ]]; then
   printf '%s\n\n' '已安装的 Volto 可用 sudo bash volto-onekey.sh update 升级。'
 elif should_prompt_for_port "$@"; then
@@ -187,10 +221,14 @@ elif should_prompt_for_port "$@"; then
   set -- "$@" --port "$selected_port"
 fi
 
+need_cmd curl
+need_cmd sha256sum
+
 installer=$(mktemp)
 trap 'rm -f -- "$installer"' EXIT
 
 curl --proto '=https' --fail --silent --show-error --location \
+  --retry 3 --retry-max-time 60 --connect-timeout 10 --max-time 60 \
   --output "$installer" "$upstream_url"
 
 download_sha256=$(sha256sum < "$installer")
@@ -200,10 +238,7 @@ if [[ "${download_sha256%% *}" != "$upstream_sha256" ]]; then
 fi
 
 if [[ $update_only == true ]]; then
-  if [[ ! -f $config ]]; then
-    printf 'Volto 配置 %s 已移除，升级已停止。\n' "$config" >&2
-    exit 1
-  fi
+  check_config_for_update "Volto 配置 ${config} 已移除，升级已停止。"
   # The timer needs a verified on-disk bootstrap even when no upgrade is due.
   bash "$installer" "$@" </dev/null
   exit 0
@@ -214,9 +249,10 @@ if [[ ! -e $config && ! -L $config ]]; then
   first_install=true
 fi
 
-# Match the upstream bootstrap's stdin invocation and keep stdout attached
-# to the terminal so the upstream installer can display the Surge password.
-bash -s -- "$@" < "$installer"
+# Run from the verified on-disk file so --enable-timer works even when already
+# current, detach stdin to match upstream's non-interactive SNI default, and
+# keep stdout attached to the terminal so the Surge password can be displayed.
+bash "$installer" "$@" </dev/null
 if [[ $first_install == true && -f $config ]]; then
   enable_dual_stack
 fi

@@ -44,12 +44,12 @@ curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/volto-o
 | 操作 | 命令 |
 | --- | --- |
 | 查看当前版本 | `volto --version` |
-| 指定发布版本 | `sudo bash volto-onekey.sh update --tag v1.8.3` |
-| 预演 | `sudo bash volto-onekey.sh update --dry-run --tag v1.8.3` |
+| 指定发布版本 | `sudo bash volto-onekey.sh update --tag v1.8.5` |
+| 预演 | `sudo bash volto-onekey.sh update --dry-run --tag v1.8.5` |
 | 启用每日更新 | `sudo bash volto-onekey.sh update --enable-timer` |
 | 查看升级帮助 | `bash volto-onekey.sh update --help` |
 
-[Volto 上游部署文档](https://github.com/vcarus/volto/blob/v1.8.3/docs/deployment.md#deploying-from-releases)
+[Volto 上游部署文档](https://github.com/vcarus/volto/blob/v1.8.5/docs/deployment.md#deploying-from-releases)
 
 ### 配置 Surge
 
@@ -90,7 +90,8 @@ curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/mieru-o
 | 操作 | 命令 |
 | --- | --- |
 | 查看实际内核版本 | `mita version` |
-| 指定目标版本 | `sudo env MIERU_VERSION=3.40.0 bash mieru-onekey.sh update` |
+| 指定目标版本 | `sudo bash mieru-onekey.sh update --version 3.40.0`（或 `MIERU_VERSION=3.40.0`） |
+| 升级到最新正式版 | `sudo bash mieru-onekey.sh update --version latest` |
 | 预演 | `sudo bash mieru-onekey.sh update --dry-run` |
 | 查看状态 | `sudo bash mieru-onekey.sh status` |
 | 重启代理 | `sudo bash mieru-onekey.sh restart` |

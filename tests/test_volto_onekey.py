@@ -27,7 +27,16 @@ fi
 
 
 class TestVoltoListen(unittest.TestCase):
-    def deploy(self, *, existing=None, initial=ORIGINAL, mode='', args=('--port', '27299')):
+    def deploy(
+        self,
+        *,
+        existing=None,
+        initial=ORIGINAL,
+        mode='',
+        args=('--port', '27299'),
+        extra_env=None,
+        unreadable_conf_dir=False,
+    ):
         with tempfile.TemporaryDirectory() as dirname:
             root = Path(dirname)
             config = root / 'etc/volto/config.toml'
@@ -60,6 +69,10 @@ class TestVoltoListen(unittest.TestCase):
                         if [[ $MODE != old ]]; then echo --check-config; fi
                         exit 0
                     fi
+                    if [[ $MODE == check_rust_log && -n ${RUST_LOG:-} ]]; then
+                        echo "unexpected RUST_LOG=$RUST_LOG" >&2
+                        exit 1
+                    fi
                     [[ $1 == --check-config && $2 == --config ]] &&
                         grep -qF 'listen = "[::]:27299"' "$3" && [[ $MODE != invalid ]]
                 ''',
@@ -81,12 +94,25 @@ class TestVoltoListen(unittest.TestCase):
                 command.chmod(0o755)
             restarts_file = root / 'restarts'
             args_file = root / 'args'
-            result = subprocess.run(['bash', wrapper, *args], capture_output=True, text=True,
-                env={**os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}',
-                     'VOLTO_DEPLOY_ROOT': dirname, 'FIXTURE': str(root / 'upstream.sh'),
-                     'BOOTSTRAP_CONFIG': str(root / 'initial.toml'), 'MODE': mode,
-                     'BOOTSTRAP_ARGS': str(args_file),
-                     'RESTARTS': str(restarts_file)}, timeout=10)
+            env = {
+                **os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+                'VOLTO_DEPLOY_ROOT': dirname, 'FIXTURE': str(root / 'upstream.sh'),
+                'BOOTSTRAP_CONFIG': str(root / 'initial.toml'), 'MODE': mode,
+                'BOOTSTRAP_ARGS': str(args_file),
+                'RESTARTS': str(restarts_file),
+            }
+            if extra_env:
+                env.update(extra_env)
+            if unreadable_conf_dir:
+                config.parent.chmod(0o000)
+            try:
+                result = subprocess.run(
+                    ['bash', wrapper, *args], capture_output=True, text=True,
+                    env=env, timeout=10,
+                )
+            finally:
+                if unreadable_conf_dir:
+                    config.parent.chmod(0o755)
             files = sorted(p.name for p in config.parent.iterdir())
             self.assertEqual(['config.toml'] if config.exists() else [], files)
             if config.exists() and existing is None:
@@ -97,6 +123,14 @@ class TestVoltoListen(unittest.TestCase):
 
     def test_fresh_dual_stack_preserves_configuration(self):
         result, config, restarts, _ = self.deploy()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(DUAL_STACK, config)
+        self.assertEqual(['listen = "[::]:27299"'], restarts)
+
+    def test_dual_stack_unsets_caller_rust_log_for_check_config(self):
+        result, config, restarts, _ = self.deploy(
+            mode='check_rust_log', extra_env={'RUST_LOG': 'off'},
+        )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(DUAL_STACK, config)
         self.assertEqual(['listen = "[::]:27299"'], restarts)
@@ -141,7 +175,7 @@ class TestVoltoListen(unittest.TestCase):
         self.assertEqual(['--help'], upstream_args)
 
     def test_update_forwards_release_options_and_keeps_existing_config(self):
-        for flags in ((), ('--tag', 'v1.8.3', '--dry-run')):
+        for flags in ((), ('--tag', 'v1.8.3', '--dry-run'), ('--tag', 'v1.8.5', '--force')):
             with self.subTest(flags=flags):
                 result, config, restarts, upstream_args = self.deploy(
                     existing=DUAL_STACK, args=('update', *flags),
@@ -151,11 +185,24 @@ class TestVoltoListen(unittest.TestCase):
                 self.assertEqual([], restarts)
                 self.assertEqual(list(flags), upstream_args)
 
-    def test_update_rejects_missing_config_and_install_options(self):
+    def test_update_allows_dry_run_with_tag_env(self):
+        result, config, restarts, upstream_args = self.deploy(
+            existing=DUAL_STACK, args=('update', '--dry-run'), extra_env={'TAG': 'v1.8.5'},
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(DUAL_STACK, config)
+        self.assertEqual([], restarts)
+        self.assertEqual(['--dry-run'], upstream_args)
+
+    def test_update_rejects_missing_config_and_bad_options_before_download(self):
         cases = [
             (None, ('update',)),
             (ORIGINAL, ('update', '--port', '2443')),
             (ORIGINAL, ('update', '--tag', '--force')),
+            (ORIGINAL, ('update', '--tag', '')),
+            (ORIGINAL, ('update', '--tag', '1.8.5')),
+            (ORIGINAL, ('update', '--dry-run')),
+            (ORIGINAL, ('update', '--force')),
         ]
         for existing, args in cases:
             with self.subTest(args=args):
@@ -165,6 +212,18 @@ class TestVoltoListen(unittest.TestCase):
                 self.assertEqual([], restarts)
                 self.assertIsNone(upstream_args)
 
+    def test_update_reports_sudo_hint_when_config_dir_unreadable(self):
+        if os.geteuid() == 0:
+            self.skipTest('root bypasses 0000 directory permissions')
+        result, config, restarts, upstream_args = self.deploy(
+            existing=DUAL_STACK, args=('update',), unreadable_conf_dir=True,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('sudo', result.stderr)
+        self.assertEqual(DUAL_STACK, config)
+        self.assertEqual([], restarts)
+        self.assertIsNone(upstream_args)
+
     def test_update_help_does_not_require_installation(self):
         result, config, restarts, upstream_args = self.deploy(args=('update', '--help'))
         self.assertEqual(0, result.returncode, result.stderr)
@@ -173,14 +232,16 @@ class TestVoltoListen(unittest.TestCase):
         self.assertEqual([], restarts)
         self.assertIsNone(upstream_args)
 
-    def test_update_timer_can_reuse_verified_installer_on_current_release(self):
-        result, config, restarts, upstream_args = self.deploy(
-            existing=DUAL_STACK, args=('update', '--enable-timer'),
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual(DUAL_STACK, config)
-        self.assertEqual([], restarts)
-        self.assertEqual(['--enable-timer'], upstream_args)
+    def test_update_timer_and_direct_timer_can_reuse_verified_installer(self):
+        for args in (('update', '--enable-timer'), ('--enable-timer',)):
+            with self.subTest(args=args):
+                result, config, restarts, upstream_args = self.deploy(
+                    existing=DUAL_STACK, args=args,
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(DUAL_STACK, config)
+                self.assertEqual([], restarts)
+                self.assertEqual(['--enable-timer'], upstream_args)
 
     def test_interruption_restores_ipv4_listener(self):
         result, config, restarts, _ = self.deploy(mode='interrupted')
