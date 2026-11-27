@@ -1,7 +1,9 @@
 import hashlib
 import os
 from pathlib import Path
+import pty
 import re
+import select
 import subprocess
 import tempfile
 import unittest
@@ -11,10 +13,13 @@ WRAPPER = Path(__file__).resolve().parents[1] / 'volto-onekey.sh'
 ORIGINAL = (
     '[server]\n'
     'listen = "0.0.0.0:27299"\n'
+    'cert = "/etc/volto/cert.pem"\n'
     '#ech_key = "/etc/volto/ech.pem"\n'
     '\n'
     '[auth]\n'
-    'users = { demo = "fixture" }\n'
+    'users = [\n'
+    '  { username = "surge", password = "secret-password" },\n'
+    ']\n'
     '\n'
     '[limits]\n'
     'initial_mtu = 1242\n'
@@ -35,8 +40,47 @@ done
 if [[ ! -f "$VOLTO_DEPLOY_ROOT/etc/volto/config.toml" ]]; then
   cp "$BOOTSTRAP_CONFIG" "$VOLTO_DEPLOY_ROOT/etc/volto/config.toml"
   chmod 640 "$VOLTO_DEPLOY_ROOT/etc/volto/config.toml"
+  printf 'DUMMY CERT\\n' > "$VOLTO_DEPLOY_ROOT/etc/volto/cert.pem"
+  printf 'certificate: sha256 Fingerprint=AA:BB:CC:DD\\n\\n'
+  printf 'Surge policy line (replace the address if this host is behind a relay):\\n\\n'
+  printf '  volto = masque, 203.0.113.10, 27299, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:CC:DD, username=surge, password=UPSTREAM_PASS\\n\\n'
+  printf 'Security notes:\\n  * mock note\\n'
 fi
 '''
+
+
+def _run_in_pty(cmd, env, timeout=15):
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=slave_fd,
+        stderr=subprocess.PIPE,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    chunks = []
+    try:
+        while True:
+            ready, _, _ = select.select([master_fd], [], [], timeout)
+            if not ready:
+                proc.kill()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+        stderr = proc.stderr.read().decode('utf-8', errors='replace')
+        proc.wait(timeout=timeout)
+    finally:
+        os.close(master_fd)
+        proc.stderr.close()
+    stdout = b''.join(chunks).decode('utf-8', errors='replace').replace('\r\n', '\n')
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 class TestVoltoListen(unittest.TestCase):
@@ -44,11 +88,14 @@ class TestVoltoListen(unittest.TestCase):
         self,
         *,
         existing=None,
+        existing_cert=False,
+        existing_ech=None,
         initial=ORIGINAL,
         mode='',
         args=('--port', '27299'),
         extra_env=None,
         unreadable_conf_dir=False,
+        use_tty=False,
     ):
         with tempfile.TemporaryDirectory() as dirname:
             root = Path(dirname)
@@ -57,6 +104,10 @@ class TestVoltoListen(unittest.TestCase):
             (root / 'run').mkdir()
             if existing is not None:
                 config.write_text(existing)
+            if existing_cert:
+                (config.parent / 'cert.pem').write_text('DUMMY CERT\n')
+            if existing_ech is not None:
+                (config.parent / 'ech.pem').write_text(existing_ech)
             (root / 'upstream.sh').write_bytes(UPSTREAM)
             (root / 'initial.toml').write_text(initial)
             wrapper = root / 'wrapper.sh'
@@ -73,6 +124,17 @@ class TestVoltoListen(unittest.TestCase):
             fake_bin.mkdir(parents=True)
             commands = {
                 'curl': 'while [[ $1 != --output ]]; do shift; done; cp "$FIXTURE" "$2"',
+                'hostname': 'if [[ $1 == -I ]]; then echo "203.0.113.10 2001:db8::10"; fi',
+                'openssl': r'''
+                    case "$*" in
+                        *-fingerprint*-sha256*)
+                            printf 'sha256 Fingerprint=AA:BB:CC:DD\n'
+                            ;;
+                        *-ext*subjectAltName*)
+                            printf 'X509v3 Subject Alternative Name:\n    DNS:volto.internal\n'
+                            ;;
+                    esac
+                ''',
                 'sysctl': r'''
                     if [[ $1 == -n ]]; then
                         case $2 in
@@ -116,6 +178,11 @@ class TestVoltoListen(unittest.TestCase):
                         printf 'AEX+MOCK+ECHCONFIG+LIST\n'
                         exit 0
                     fi
+                    if [[ $1 == ech-config ]]; then
+                        [[ -r ${2:-} ]] || exit 1
+                        printf 'AEX+MOCK+ECHCONFIG+LIST\n'
+                        exit 0
+                    fi
                     if [[ $MODE == check_rust_log && -n ${RUST_LOG:-} ]]; then
                         echo "unexpected RUST_LOG=$RUST_LOG" >&2
                         exit 1
@@ -156,10 +223,13 @@ class TestVoltoListen(unittest.TestCase):
             if unreadable_conf_dir:
                 config.parent.chmod(0o000)
             try:
-                result = subprocess.run(
-                    ['bash', str(wrapper), *args], capture_output=True, text=True,
-                    env=env, timeout=15,
-                )
+                if use_tty:
+                    result = _run_in_pty(['bash', str(wrapper), *args], env=env, timeout=15)
+                else:
+                    result = subprocess.run(
+                        ['bash', str(wrapper), *args], capture_output=True, text=True,
+                        env=env, timeout=15,
+                    )
             finally:
                 if unreadable_conf_dir:
                     config.parent.chmod(0o755)
@@ -172,6 +242,7 @@ class TestVoltoListen(unittest.TestCase):
             return {
                 'result': result,
                 'config': config.read_text() if config.exists() else None,
+                'config_path': str(config),
                 'files': files,
                 'restarts': restarts,
                 'upstream_args': upstream_args,
@@ -190,14 +261,36 @@ class TestVoltoListen(unittest.TestCase):
         self.assertIn('expected_sni = ["volto.internal"]', cfg)
         self.assertIn('require_ech = true', cfg)
         self.assertRegex(cfg, r'ech_key = ".*/etc/volto/ech\.pem"')
-        self.assertEqual(['config.toml', 'ech.pem'], out['files'])
+        self.assertEqual(['cert.pem', 'config.toml', 'ech.pem'], out['files'])
         self.assertEqual(0o640, out['ech_mode'])
         self.assertEqual('cloudflare-ech.com', out['ech_pub'])
-        self.assertIn('ech-config=AEX+MOCK+ECHCONFIG+LIST', out['result'].stdout)
+        expected_line = (
+            '  volto = masque, 203.0.113.10, 27299, sni=volto.internal, '
+            'server-cert-fingerprint-sha256=AA:BB:CC:DD, '
+            'ech-config=AEX+MOCK+ECHCONFIG+LIST, username=surge, '
+            f'password=<as in {out["config_path"]}>'
+        )
+        self.assertIn(expected_line, out['result'].stdout)
+        self.assertEqual(1, out['result'].stdout.count('volto = masque,'))
+        self.assertNotIn('UPSTREAM_PASS', out['result'].stdout)
+        self.assertIn('Security notes:', out['result'].stdout)
         self.assertIn('net.core.rmem_max = 4194304', out['sysctl_conf'])
         self.assertIn('net.core.wmem_max = 4194304', out['sysctl_conf'])
         self.assertEqual(['net.core.rmem_max=4194304', 'net.core.wmem_max=4194304'], out['sysctl_writes'])
         self.assertEqual(['listen = "[::]:27299"'], out['restarts'])
+
+    def test_fresh_install_prints_complete_surge_line_with_password_on_tty(self):
+        out = self.deploy(use_tty=True)
+        self.assertEqual(0, out['result'].returncode, out['result'].stderr)
+        expected_line = (
+            '  volto = masque, 203.0.113.10, 27299, sni=volto.internal, '
+            'server-cert-fingerprint-sha256=AA:BB:CC:DD, '
+            'ech-config=AEX+MOCK+ECHCONFIG+LIST, username=surge, '
+            'password=secret-password'
+        )
+        self.assertIn(expected_line, out['result'].stdout)
+        self.assertEqual(1, out['result'].stdout.count('volto = masque,'))
+        self.assertNotIn('UPSTREAM_PASS', out['result'].stdout)
 
     def test_high_udp_buffers_are_not_lowered(self):
         out = self.deploy(mode='high_buf')
@@ -209,10 +302,12 @@ class TestVoltoListen(unittest.TestCase):
         out = self.deploy(args=('--port', '27299', '--sni', 'edge.example', '--no-ech'))
         self.assertEqual(0, out['result'].returncode, out['result'].stderr)
         self.assertEqual(['--port', '27299', '--sni', 'edge.example'], out['upstream_args'])
-        self.assertEqual(['config.toml'], out['files'])
+        self.assertEqual(['cert.pem', 'config.toml'], out['files'])
         self.assertIn('expected_sni = ["edge.example"]', out['config'])
         self.assertNotIn('\nrequire_ech = true', out['config'])
         self.assertNotIn('\nech_key =', out['config'])
+        self.assertIn('UPSTREAM_PASS', out['result'].stdout)
+        self.assertNotIn('ech-config=', out['result'].stdout)
 
     def test_custom_ech_public_name_and_sni(self):
         out = self.deploy(args=('--port', '27299', '--sni', 'proxy.example', '--ech-public-name', 'public.example'))
@@ -220,6 +315,7 @@ class TestVoltoListen(unittest.TestCase):
         self.assertEqual(['--port', '27299', '--sni', 'proxy.example'], out['upstream_args'])
         self.assertEqual('public.example', out['ech_pub'])
         self.assertIn('expected_sni = ["proxy.example"]', out['config'])
+        self.assertIn('sni=proxy.example, server-cert-fingerprint-sha256=AA:BB:CC:DD, ech-config=AEX+MOCK+ECHCONFIG+LIST', out['result'].stdout)
 
     def test_dual_stack_unsets_caller_rust_log_for_check_config(self):
         out = self.deploy(mode='check_rust_log', extra_env={'RUST_LOG': 'off'})
@@ -240,8 +336,10 @@ class TestVoltoListen(unittest.TestCase):
         out = self.deploy(mode='old')
         self.assertEqual(0, out['result'].returncode, out['result'].stderr)
         self.assertEqual(ORIGINAL, out['config'])
-        self.assertEqual(['config.toml'], out['files'])
+        self.assertEqual(['cert.pem', 'config.toml'], out['files'])
         self.assertEqual([], out['restarts'])
+        self.assertEqual(1, out['result'].stdout.count('volto = masque,'))
+        self.assertNotIn('ech-config=', out['result'].stdout)
 
     def test_existing_config_is_preserved_without_rewriting(self):
         out = self.deploy(existing=ORIGINAL)
@@ -255,7 +353,7 @@ class TestVoltoListen(unittest.TestCase):
         out = self.deploy(mode='invalid')
         self.assertNotEqual(0, out['result'].returncode)
         self.assertEqual(ORIGINAL, out['config'])
-        self.assertEqual(['config.toml'], out['files'])
+        self.assertEqual(['cert.pem', 'config.toml'], out['files'])
         self.assertEqual([], out['restarts'])
 
     def test_failed_restart_or_listener_verification_rolls_back_config_and_ech(self):
@@ -264,14 +362,66 @@ class TestVoltoListen(unittest.TestCase):
                 out = self.deploy(mode=mode)
                 self.assertNotEqual(0, out['result'].returncode)
                 self.assertEqual(ORIGINAL, out['config'])
-                self.assertEqual(['config.toml'], out['files'])
+                self.assertEqual(['cert.pem', 'config.toml'], out['files'])
                 self.assertEqual(['listen = "[::]:27299"', 'listen = "0.0.0.0:27299"'], out['restarts'])
+
+    def test_show_subcommand_outputs_complete_surge_line_without_download(self):
+        hardened = ORIGINAL.replace('#ech_key = "/etc/volto/ech.pem"', 'ech_key = "/etc/volto/ech.pem"').replace(
+            '#expected_sni = []', 'expected_sni = ["edge.example"]'
+        )
+        out_non_tty = self.deploy(
+            existing=hardened,
+            existing_cert=True,
+            existing_ech='PRIVATE KEY\nECHCONFIG\n',
+            args=('show',),
+        )
+        self.assertEqual(0, out_non_tty['result'].returncode, out_non_tty['result'].stderr)
+        self.assertIsNone(out_non_tty['upstream_args'])
+        self.assertIn(
+            '  volto = masque, 203.0.113.10, 27299, sni=edge.example, '
+            'server-cert-fingerprint-sha256=AA:BB:CC:DD, '
+            'ech-config=AEX+MOCK+ECHCONFIG+LIST, username=surge, '
+            f'password=<as in {out_non_tty["config_path"]}>',
+            out_non_tty['result'].stdout,
+        )
+
+        out_tty = self.deploy(
+            existing=hardened,
+            existing_cert=True,
+            existing_ech='PRIVATE KEY\nECHCONFIG\n',
+            args=('show',),
+            use_tty=True,
+        )
+        self.assertEqual(0, out_tty['result'].returncode, out_tty['result'].stderr)
+        self.assertIsNone(out_tty['upstream_args'])
+        self.assertIn(
+            '  volto = masque, 203.0.113.10, 27299, sni=edge.example, '
+            'server-cert-fingerprint-sha256=AA:BB:CC:DD, '
+            'ech-config=AEX+MOCK+ECHCONFIG+LIST, username=surge, '
+            'password=secret-password',
+            out_tty['result'].stdout,
+        )
+
+    def test_show_help_and_error_cases(self):
+        out_help = self.deploy(args=('show', '--help'))
+        self.assertEqual(0, out_help['result'].returncode, out_help['result'].stderr)
+        self.assertIn('volto-onekey.sh show', out_help['result'].stdout)
+        self.assertIsNone(out_help['upstream_args'])
+
+        out_missing = self.deploy(args=('show',))
+        self.assertNotEqual(0, out_missing['result'].returncode)
+        self.assertIsNone(out_missing['upstream_args'])
+
+        out_extra = self.deploy(existing=ORIGINAL, args=('show', '--extra'))
+        self.assertNotEqual(0, out_extra['result'].returncode)
+        self.assertIsNone(out_extra['upstream_args'])
 
     def test_help_does_not_install(self):
         out = self.deploy(args=('--help',))
         self.assertEqual(0, out['result'].returncode, out['result'].stderr)
         self.assertIn('upstream help', out['result'].stdout)
         self.assertIn('--no-ech', out['result'].stdout)
+        self.assertIn('volto-onekey.sh show', out['result'].stdout)
         self.assertIsNone(out['config'])
         self.assertIsNone(out['sysctl_conf'])
         self.assertEqual([], out['sysctl_writes'])
@@ -344,7 +494,7 @@ class TestVoltoListen(unittest.TestCase):
         out = self.deploy(mode='interrupted')
         self.assertEqual(143, out['result'].returncode)
         self.assertEqual(ORIGINAL, out['config'])
-        self.assertEqual(['config.toml'], out['files'])
+        self.assertEqual(['cert.pem', 'config.toml'], out['files'])
         self.assertEqual(['listen = "[::]:27299"', 'listen = "0.0.0.0:27299"'], out['restarts'])
 
 

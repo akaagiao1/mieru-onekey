@@ -212,7 +212,7 @@ ensure_udp_buffers() {
 }
 
 detect_cert_sni() {
-  local cert="$deploy_root/etc/volto/cert.pem" san=""
+  local cert="${1:-$deploy_root/etc/volto/cert.pem}" san=""
   if [[ -n $requested_sni ]]; then
     printf '%s\n' "$requested_sni"
     return 0
@@ -226,6 +226,151 @@ detect_cert_sni() {
     fi
   fi
   printf '%s\n' 'volto.internal'
+}
+
+resolve_deploy_path() {
+  local path="$1"
+  if [[ -n $deploy_root && $path == /* && $path != "$deploy_root/"* ]]; then
+    printf '%s%s\n' "$deploy_root" "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+detect_server_address() {
+  local ips ip ipv4="" ipv6="" first=""
+  ips=$(hostname -I 2>/dev/null || true)
+  for ip in $ips; do
+    [[ -z $first ]] && first="$ip"
+    if [[ $ip != *:* ]]; then
+      ipv4="$ip"
+      break
+    elif [[ -z $ipv6 && $ip != fe80:* && $ip != ::1 ]]; then
+      ipv6="$ip"
+    fi
+  done
+  if [[ -n $ipv4 ]]; then
+    printf '%s\n' "$ipv4"
+  elif [[ -n $ipv6 ]]; then
+    printf '%s\n' "$ipv6"
+  elif [[ -n $first ]]; then
+    printf '%s\n' "$first"
+  else
+    printf '%s\n' '<server-ip>'
+  fi
+}
+
+read_config_string_key() {
+  local target_section="$1" target_key="$2"
+  local section="" line val=""
+  local sec_re='^\[([^]]+)\][[:space:]]*$'
+  local key_re="^[[:space:]]*${target_key}[[:space:]]*=[[:space:]]*\"([^\"]*)\""
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*# ]] && continue
+    if [[ $line =~ $sec_re ]]; then
+      section="${BASH_REMATCH[1]}"
+      continue
+    fi
+    if [[ $section == "$target_section" && $line =~ $key_re ]]; then
+      val="${BASH_REMATCH[1]}"
+      break
+    fi
+  done < "$config" || true
+  printf '%s\n' "$val"
+}
+
+read_config_expected_sni() {
+  local section="" line val=""
+  local sec_re='^\[([^]]+)\][[:space:]]*$'
+  local sni_re='^[[:space:]]*expected_sni[[:space:]]*=[[:space:]]*\[[[:space:]]*"([^"]+)"'
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*# ]] && continue
+    if [[ $line =~ $sec_re ]]; then
+      section="${BASH_REMATCH[1]}"
+      continue
+    fi
+    if [[ $section == security && $line =~ $sni_re ]]; then
+      val="${BASH_REMATCH[1]}"
+      break
+    fi
+  done < "$config" || true
+  printf '%s\n' "$val"
+}
+
+filter_upstream_surge_block() {
+  awk '
+    /^Surge policy line/ { skip = 2; next }
+    skip > 0 && $0 == "" { skip--; next }
+    /^[[:space:]]*volto = masque,/ { skip = 1; next }
+    { skip = 0; print; fflush() }
+  '
+}
+
+print_surge_policy_line() {
+  local binary="$deploy_root/usr/local/bin/volto"
+  if [[ ! -x $binary && -z $deploy_root ]]; then
+    binary=$(command -v volto 2>/dev/null || true)
+  fi
+  local cert_cfg cert_file fingerprint="" fp_val=""
+  local listen_val port address sni
+  local ech_key_cfg ech_file ech_config_list="" ech_part=""
+  local conf_username="" conf_password="" shown_password="" line
+  local user_re='\{[[:space:]]*username[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*,[[:space:]]*password[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*\}'
+
+  cert_cfg=$(read_config_string_key server cert)
+  [[ -n $cert_cfg ]] || cert_cfg="/etc/volto/cert.pem"
+  cert_file=$(resolve_deploy_path "$cert_cfg")
+
+  if [[ -r $cert_file ]] && command -v openssl >/dev/null 2>&1; then
+    fingerprint=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null || true)
+  fi
+  fp_val="${fingerprint#*=}"
+  [[ -n $fp_val ]] || fp_val='<unknown>'
+
+  address=$(detect_server_address)
+
+  listen_val=$(read_config_string_key server listen)
+  port="${listen_val##*:}"
+  [[ $port =~ ^[0-9]+$ ]] || port='<port>'
+
+  sni=$(read_config_expected_sni)
+  [[ -n $sni ]] || sni=$(detect_cert_sni "$cert_file")
+
+  # Read credentials with bash builtins so plaintext passwords never appear in /proc/<pid>/cmdline.
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*# ]] && continue
+    if [[ $line =~ $user_re ]]; then
+      conf_username="${BASH_REMATCH[1]}"
+      conf_password="${BASH_REMATCH[2]}"
+      break
+    fi
+  done < "$config" || true
+  [[ -n $conf_username ]] || conf_username='<unknown>'
+  [[ -n $conf_password ]] || conf_password='<unknown>'
+
+  if [[ -t 1 ]]; then
+    shown_password="$conf_password"
+  else
+    shown_password="<as in $config>"
+  fi
+
+  ech_key_cfg=$(read_config_string_key server ech_key)
+  if [[ -n $ech_key_cfg ]]; then
+    ech_file=$(resolve_deploy_path "$ech_key_cfg")
+    if [[ -x $binary && -r $ech_file ]]; then
+      ech_config_list=$("$binary" ech-config "$ech_file" 2>/dev/null | tr -d ' \t\r\n' || true)
+    fi
+    if [[ -z $ech_config_list ]]; then
+      printf '警告: 无法从 %s 读取 ECHConfigList，请运行 volto ech-config %s 检查。\n' "$ech_file" "$ech_file" >&2
+      ech_config_list='<unknown>'
+    fi
+    ech_part=", ech-config=${ech_config_list}"
+  fi
+
+  printf '\n'
+  printf 'Surge 完整配置（可直接粘贴到 [Proxy]，中转时替换 IP/端口即可）:\n\n'
+  printf '  volto = masque, %s, %s, sni=%s, server-cert-fingerprint-sha256=%s%s, username=%s, password=%s\n\n' \
+    "$address" "$port" "$sni" "$fp_val" "$ech_part" "$conf_username" "$shown_password"
 }
 
 choose_ech_public_name() {
@@ -446,8 +591,6 @@ configure_fresh_install() (
     fi
     if (( want_ech == 1 )); then
       printf 'Volto ECH 已启用: require_ech = true（外部 public_name=%s，密钥=%s）。\n' "$pub_name" "$ech_cfg_path"
-      printf '请在 Surge 节点行追加以下参数（无此参数握手将被静默丢弃）:\n'
-      printf '  ech-config=%s\n' "$ech_config_list"
     fi
     return 0
   fi
@@ -462,7 +605,25 @@ no_ech=false
 ech_public_name=${ECH_PUBLIC_NAME:-}
 requested_sni=${SNI:-}
 
-if [[ ${1:-} == update ]]; then
+if [[ ${1:-} == show ]]; then
+  shift
+  if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+    cat <<'HELP'
+输出当前已安装 Volto 的完整 Surge 节点配置（含 ech-config）
+  sudo bash volto-onekey.sh show
+
+仅在交互终端输出明文密码；重定向或非终端环境下会隐藏密码。
+HELP
+    exit 0
+  fi
+  if (( $# > 0 )); then
+    printf 'show 不接受参数 %s，请用 show --help 查看用法。\n' "$1" >&2
+    exit 1
+  fi
+  check_config_for_update "找不到 Volto 配置 ${config}。请先运行安装命令。"
+  print_surge_policy_line
+  exit 0
+elif [[ ${1:-} == update ]]; then
   update_only=true
   shift
   check_update_options "$@"
@@ -470,7 +631,9 @@ if [[ ${1:-} == update ]]; then
 elif [[ ${1:-} == --help || ${1:-} == -h ]]; then
   help_only=true
   cat <<'HELP'
-已安装的 Volto 可用 sudo bash volto-onekey.sh update 升级。
+已安装的 Volto 可用:
+  sudo bash volto-onekey.sh show     查看当前完整 Surge 节点配置（含 ech-config）
+  sudo bash volto-onekey.sh update   升级已安装的 Volto
 
 额外加固选项（仅首次安装生效，默认全部开启）:
   --no-ech                     不启用 ECH / require_ech（兼容 Apple NERelay 客户端）
@@ -481,6 +644,7 @@ elif [[ ${1:-} == --help || ${1:-} == -h ]]; then
   - 开启 [security] expected_sni = ["<证书SNI>"]
   - 生成 /etc/volto/ech.pem 并开启 ech_key + require_ech = true
   - 有全局 IPv6 且支持双栈时切换 [::] 并将 initial_mtu 调整为 1200
+  - 末尾直接输出可直接粘贴的完整 Surge 节点配置（已包含 ech-config）
 
 HELP
 else
@@ -556,8 +720,18 @@ fi
 
 # Run from the verified on-disk file so --enable-timer works even when already
 # current, detach stdin to match upstream's non-interactive SNI default, and
-# keep stdout attached to the terminal so the Surge password can be displayed.
-bash "$installer" "$@" </dev/null
+# replace upstream's incomplete non-ECH Surge line with our complete ECH line
+# when ECH hardening is enabled on a fresh install.
+suppressed_upstream_surge=false
+if [[ $first_install == true && $no_ech != true ]]; then
+  suppressed_upstream_surge=true
+  bash "$installer" "$@" </dev/null | filter_upstream_surge_block
+else
+  bash "$installer" "$@" </dev/null
+fi
 if [[ $first_install == true && -f $config ]]; then
   configure_fresh_install
+  if [[ $suppressed_upstream_surge == true ]]; then
+    print_surge_policy_line
+  fi
 fi

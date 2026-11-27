@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/volto-o
 
 - **内核 UDP 缓冲调优**：自动检查并将 `net.core.rmem_max` / `net.core.wmem_max` 提升并持久化至至少 `4194304`（4 MB，不降低原本更高的值），写入 `/etc/sysctl.d/90-volto-udp-buffers.conf`。
 - **抗扫描 SNI Gate**：自动开启 `[security] expected_sni = ["<证书SNI>"]`，未知 SNI 的扫描包在 Socket 层静默丢弃。
-- **私有 ECH 强制校验**：自动调用 `volto ech-keygen` 生成 `/etc/volto/ech.pem`（`0640 root:volto`），启用 `ech_key` 与 `require_ech = true`，并在终端输出需要追加到 Surge 节点行的 `ech-config=...`（可用 `--ech-public-name <域名>` 自定义外部明文域名，默认 `cloudflare-ech.com`；如需兼容不支持 ECH 的 Apple `NERelay`，可加 `--no-ech`）。
+- **私有 ECH 强制校验**：自动调用 `volto ech-keygen` 生成 `/etc/volto/ech.pem`（`0640 root:volto`），启用 `ech_key` 与 `require_ech = true`，并在安装末尾直接输出包含 `ech-config=...` 的完整 Surge 节点行（可用 `--ech-public-name <域名>` 自定义外部明文域名，默认 `cloudflare-ech.com`；如需兼容不支持 ECH 的 Apple `NERelay`，可加 `--no-ech`）。
 - **双栈监听与 MTU 修正**：具有全局 IPv6 地址且内核支持双栈（`net.ipv6.bindv6only=0`）的 VPS 会在同一个 UDP 端口监听 IPv4 和 IPv6，并同步将 `initial_mtu` 调整为 `1200`（避免 IPv6 首包超过 1280 字节）。按实际采用的 IP 协议和端口放行安全组及防火墙的 UDP 入站。
 
 ### 升级 Volto
@@ -48,6 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/volto-o
 
 | 操作 | 命令 |
 | --- | --- |
+| 查看当前完整 Surge 配置 | `sudo bash volto-onekey.sh show` |
 | 查看当前版本 | `volto --version` |
 | 指定发布版本 | `sudo bash volto-onekey.sh update --tag v1.8.5` |
 | 预演 | `sudo bash volto-onekey.sh update --dry-run --tag v1.8.5` |
@@ -58,10 +59,9 @@ curl -fsSL https://raw.githubusercontent.com/akaagiao1/mieru-onekey/main/volto-o
 
 ### 配置 Surge
 
-1. 把安装终端输出中 `volto = masque, ...` 的整行粘贴到 Surge 配置的 `[Proxy]` 段。
-2. 若启用了 ECH（默认开启），把安装末尾输出的 `ech-config=...` 追加到同一行末尾（未追加时握手会被服务端静默丢弃）。
-3. 通过 IPv6 或中转 IP 连接时，把节点行的服务器地址替换为实际连接地址，保留 `sni`、`server-cert-fingerprint-sha256`（或 `server-cert-verify-name`）与 `ech-config`。
-4. 把 `volto` 加到使用的策略组并测试连通性。节点行含密码与 `ech-config`，请妥善保存。
+1. 安装结束会直接输出已包含 `ech-config=...` 的完整 `volto = masque, ...` 节点行，直接整行粘贴到 Surge 配置的 `[Proxy]` 段即可（事后也可用 `sudo bash volto-onekey.sh show` 重新查看）。
+2. 通过 IPv6 或中转 IP 连接时，把节点行的服务器地址（和中转端口）替换为实际连接地址，保留 `sni`、`server-cert-fingerprint-sha256`（或 `server-cert-verify-name`）与 `ech-config`。
+3. 把 `volto` 加到使用的策略组并测试连通性。节点行含密码与 `ech-config`，请妥善保存。
 
 需要 Surge iOS 5.22.0 或 macOS 6.9.0 及以上版本。[Surge MASQUE 文档](https://manual.nssurge.com/policies/masque.html)
 
