@@ -8,12 +8,42 @@ upstream_sha256=b53abf79770c394022d608394d31b1f38c0800d15b7036e8d248cdaf17c2ea5a
 upstream_url="https://raw.githubusercontent.com/vcarus/volto/$upstream_commit/script/deploy.sh"
 deploy_root=${VOLTO_DEPLOY_ROOT:-}
 config="$deploy_root/etc/volto/config.toml"
+min_udp_buffer=4194304
+default_ech_public_name="cloudflare-ech.com"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf '缺少必需命令 %s，请先安装。\n' "$1" >&2
     exit 1
   fi
+}
+
+find_sysctl() {
+  if command -v sysctl >/dev/null 2>&1; then
+    command -v sysctl
+  elif [[ -x /usr/sbin/sysctl ]]; then
+    printf '%s\n' /usr/sbin/sysctl
+  elif [[ -x /sbin/sysctl ]]; then
+    printf '%s\n' /sbin/sysctl
+  else
+    return 1
+  fi
+}
+
+read_sysctl_int() {
+  local key="$1" val="" sc=""
+  if sc=$(find_sysctl 2>/dev/null); then
+    val=$("$sc" -n "$key" 2>/dev/null || true)
+  fi
+  if [[ ! $val =~ ^[0-9]+$ && -z $deploy_root ]]; then
+    local proc_path="/proc/sys/${key//.//}"
+    if [[ -r $proc_path ]]; then
+      val=$(<"$proc_path")
+    fi
+  fi
+  val=$(printf '%s' "$val" | tr -d ' \t\r\n')
+  [[ $val =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$val"
 }
 
 check_update_options() {
@@ -143,30 +173,215 @@ choose_port() {
   done
 }
 
-enable_dual_stack() (
-  local binary="$deploy_root/usr/local/bin/volto"
-  local addresses help port temp_dir candidate backup sockets status
-  local replacing=false
+# Ensure kernel UDP socket buffer ceilings are at least 4 MiB without lowering higher values.
+ensure_udp_buffers() {
+  local cur_rmem cur_wmem target_rmem target_wmem sysctl_dir sysctl_conf tmp sc=""
+  cur_rmem=$(read_sysctl_int net.core.rmem_max 2>/dev/null) || return 0
+  cur_wmem=$(read_sysctl_int net.core.wmem_max 2>/dev/null) || return 0
 
-  [[ $(sysctl -n net.ipv6.bindv6only 2>/dev/null) == 0 ]] || return 0
-  addresses=$(ip -6 -o addr show scope global 2>/dev/null) || return 0
-  [[ -n $addresses ]] || return 0
+  if (( cur_rmem >= min_udp_buffer && cur_wmem >= min_udp_buffer )); then
+    return 0
+  fi
+
+  target_rmem=$cur_rmem
+  target_wmem=$cur_wmem
+  (( target_rmem < min_udp_buffer )) && target_rmem=$min_udp_buffer
+  (( target_wmem < min_udp_buffer )) && target_wmem=$min_udp_buffer
+
+  sysctl_dir="$deploy_root/etc/sysctl.d"
+  sysctl_conf="$sysctl_dir/90-volto-udp-buffers.conf"
+  if mkdir -p "$sysctl_dir" 2>/dev/null; then
+    tmp=$(mktemp "$sysctl_dir/.volto-sysctl.XXXXXX") || tmp=""
+    if [[ -n $tmp ]]; then
+      {
+        printf '# Managed by volto-onekey.sh: ensure >= 4 MiB UDP socket buffer ceilings for Volto QUIC.\n'
+        printf 'net.core.rmem_max = %s\n' "$target_rmem"
+        printf 'net.core.wmem_max = %s\n' "$target_wmem"
+      } > "$tmp"
+      chmod 0644 "$tmp" 2>/dev/null || true
+      mv -f -- "$tmp" "$sysctl_conf" 2>/dev/null || rm -f -- "$tmp"
+    fi
+  fi
+
+  if sc=$(find_sysctl 2>/dev/null); then
+    "$sc" -w "net.core.rmem_max=$target_rmem" >/dev/null 2>&1 || true
+    "$sc" -w "net.core.wmem_max=$target_wmem" >/dev/null 2>&1 || true
+  fi
+
+  printf '已将内核 UDP 缓冲上限调优至 rmem_max=%s / wmem_max=%s（>= 4 MB）。\n' "$target_rmem" "$target_wmem"
+}
+
+detect_cert_sni() {
+  local cert="$deploy_root/etc/volto/cert.pem" san=""
+  if [[ -n $requested_sni ]]; then
+    printf '%s\n' "$requested_sni"
+    return 0
+  fi
+  if [[ -r $cert ]] && command -v openssl >/dev/null 2>&1; then
+    san=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null |
+      sed -nE 's/.*DNS:([^,[:space:]]+).*/\1/p' | head -n 1 || true)
+    if [[ -n $san ]]; then
+      printf '%s\n' "$san"
+      return 0
+    fi
+  fi
+  printf '%s\n' 'volto.internal'
+}
+
+choose_ech_public_name() {
+  local sni="$1" candidate="${ech_public_name:-$default_ech_public_name}"
+  if [[ ${candidate,,} == "${sni,,}" ]]; then
+    if [[ ${sni,,} == "public.volto.internal" ]]; then
+      candidate="$default_ech_public_name"
+    else
+      candidate="public.volto.internal"
+    fi
+  fi
+  printf '%s\n' "$candidate"
+}
+
+rewrite_volto_config() {
+  local src="$1" dst="$2"
+  local want_v6="$3" port="$4"
+  local want_sni="$5" sni_name="$6"
+  local want_ech="$7" ech_cfg_path="$8"
+
+  awk \
+    -v want_v6="$want_v6" \
+    -v port="$port" \
+    -v want_sni="$want_sni" \
+    -v sni_name="$sni_name" \
+    -v want_ech="$want_ech" \
+    -v ech_cfg_path="$ech_cfg_path" '
+    function flush_section(sec) {
+      if (sec == "server" && want_ech == "1" && !done_ech_key) {
+        print "ech_key = \"" ech_cfg_path "\""
+        done_ech_key = 1
+      }
+      if (sec == "security") {
+        if (want_sni == "1" && !done_sni) {
+          print "expected_sni = [\"" sni_name "\"]"
+          done_sni = 1
+        }
+        if (want_ech == "1" && !done_req_ech) {
+          print "require_ech = true"
+          done_req_ech = 1
+        }
+      }
+    }
+    BEGIN {
+      section = ""
+      saw_security = 0
+      done_ech_key = 0
+      done_sni = 0
+      done_req_ech = 0
+    }
+    /^\[[^]]+\][[:space:]]*$/ {
+      flush_section(section)
+      section = $0
+      sub(/^\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      if (section == "security") saw_security = 1
+      print $0
+      next
+    }
+    {
+      if (section == "server") {
+        if (want_v6 == "1" && $0 == "listen = \"0.0.0.0:" port "\"") {
+          print "listen = \"[::]:" port "\""
+          next
+        }
+        if (want_ech == "1" && $0 ~ /^#?[[:space:]]*ech_key[[:space:]]*=/) {
+          print "ech_key = \"" ech_cfg_path "\""
+          done_ech_key = 1
+          next
+        }
+      }
+      if (section == "limits" && want_v6 == "1") {
+        if ($0 ~ /^#?[[:space:]]*initial_mtu[[:space:]]*=/) {
+          print "initial_mtu = 1200"
+          next
+        }
+      }
+      if (section == "security") {
+        if (want_sni == "1" && $0 ~ /^#?[[:space:]]*expected_sni[[:space:]]*=/) {
+          print "expected_sni = [\"" sni_name "\"]"
+          done_sni = 1
+          next
+        }
+        if (want_ech == "1" && $0 ~ /^#?[[:space:]]*require_ech[[:space:]]*=/) {
+          print "require_ech = true"
+          done_req_ech = 1
+          next
+        }
+      }
+      print $0
+    }
+    END {
+      flush_section(section)
+      if (!saw_security && (want_sni == "1" || want_ech == "1")) {
+        print ""
+        print "[security]"
+        if (want_sni == "1" && !done_sni) print "expected_sni = [\"" sni_name "\"]"
+        if (want_ech == "1" && !done_req_ech) print "require_ech = true"
+      }
+    }
+  ' "$src" > "$dst"
+}
+
+# Atomically harden a fresh Volto install:
+# - Dual-stack listener ([::]:<port> + initial_mtu=1200) when global IPv6 and bindv6only=0
+# - SNI Gate (expected_sni = ["<cert_sni>"])
+# - Private ECH (ech_key + require_ech = true), unless --no-ech / VOLTO_NO_ECH=1
+configure_fresh_install() (
+  local binary="$deploy_root/usr/local/bin/volto"
+  local ech_file="$deploy_root/etc/volto/ech.pem"
+  local ech_cfg_path="/etc/volto/ech.pem"
+  [[ -n $deploy_root ]] && ech_cfg_path="$ech_file"
+
+  local addresses help port temp_dir candidate backup sockets status
+  local want_v6=0 want_sni=0 want_ech=0
+  local sni_name="" pub_name="" ech_config_list=""
+  local replacing=false created_ech=false
+
   command -v flock >/dev/null 2>&1 || return 0
-  command -v ss >/dev/null 2>&1 || return 0
   help=$("$binary" --help 2>&1) || return 0
   [[ $help == *--check-config* ]] || return 0
 
-  # Serialize the listener change with Volto's installer and upgrade timer.
+  # Serialize config edits with Volto's installer and upgrade timer.
   exec 9>>"$deploy_root/run/volto-deploy.lock"
   flock -x 9
   [[ -f $config && ! -L $config ]] || return 0
-  port=$(sed -nE 's/^listen = "0\.0\.0\.0:([0-9]+)"$/\1/p' "$config")
-  [[ $port =~ ^[0-9]+$ ]] || return 0
 
-  temp_dir=$(mktemp -d -- "${config%/*}/.volto-listen.XXXXXX")
+  port=$(sed -nE 's/^listen = "0\.0\.0\.0:([0-9]+)"$/\1/p' "$config")
+  if [[ $port =~ ^[0-9]+$ ]] && command -v ss >/dev/null 2>&1; then
+    if [[ $(read_sysctl_int net.ipv6.bindv6only 2>/dev/null || echo 1) == 0 ]]; then
+      addresses=$(ip -6 -o addr show scope global 2>/dev/null || true)
+      [[ -n $addresses ]] && want_v6=1
+    fi
+  fi
+
+  sni_name=$(detect_cert_sni)
+  if [[ -n $sni_name ]] && ! grep -Eq '^[[:space:]]*expected_sni[[:space:]]*=' "$config"; then
+    want_sni=1
+  fi
+
+  if [[ $no_ech != true && $help == *ech-keygen* ]] &&
+     ! grep -Eq '^[[:space:]]*ech_key[[:space:]]*=' "$config" &&
+     [[ ! -e $ech_file ]]; then
+    want_ech=1
+    pub_name=$(choose_ech_public_name "$sni_name")
+  fi
+
+  if (( want_v6 == 0 && want_sni == 0 && want_ech == 0 )); then
+    return 0
+  fi
+
+  temp_dir=$(mktemp -d -- "${config%/*}/.volto-harden.XXXXXX")
   candidate="$temp_dir/config.toml"
   backup="$temp_dir/original.toml"
-  # Keep the IPv4 config until the replacement listener has been verified.
+
+  # Keep original config and clean newly created ECH key if validation or restart fails.
   trap '
     status=$?
     trap "" HUP INT TERM
@@ -175,12 +390,17 @@ enable_dual_stack() (
         printf "无法恢复 Volto 原配置。备份位于 %s。\n" "$backup" >&2
         exit 1
       fi
+      if [[ $created_ech == true ]]; then
+        rm -f -- "$ech_file"
+      fi
       systemctl reset-failed volto >/dev/null 2>&1 || true
       if systemctl restart volto && systemctl is-active --quiet volto; then
-        printf "%s\n" "Volto 双栈切换未完成，已恢复 IPv4 监听。" >&2
+        printf "%s\n" "Volto 加固/双栈配置未完成，已恢复原配置。" >&2
       else
         printf "%s\n" "已恢复 Volto 原配置，但服务重启失败。" >&2
       fi
+    elif [[ $status -ne 0 && $created_ech == true ]]; then
+      rm -f -- "$ech_file"
     fi
     rm -rf -- "$temp_dir"
     exit "$status"
@@ -189,18 +409,46 @@ enable_dual_stack() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
+  if (( want_ech == 1 )); then
+    ech_config_list=$("$binary" ech-keygen --public-name "$pub_name" --out "$ech_file")
+    ech_config_list=$(printf '%s' "$ech_config_list" | tr -d ' \t\r\n')
+    [[ -n $ech_config_list ]] || {
+      printf '%s\n' '生成 ECH 密钥失败（未输出 ECHConfigList）。' >&2
+      return 1
+    }
+    created_ech=true
+    chgrp volto "$ech_file" 2>/dev/null || true
+    chmod 0640 "$ech_file" 2>/dev/null || true
+  fi
+
   cp -p -- "$config" "$backup"
   cp -p -- "$config" "$candidate"
-  sed "s/^listen = \"0\.0\.0\.0:$port\"$/listen = \"[::]:$port\"/" "$config" > "$candidate"
+  rewrite_volto_config "$backup" "$candidate" "$want_v6" "$port" "$want_sni" "$sni_name" "$want_ech" "$ech_cfg_path"
+
   (unset RUST_LOG; "$binary" --check-config --config "$candidate")
   replacing=true
   mv -f -- "$candidate" "$config"
 
-  if systemctl restart volto && sleep 3 && systemctl is-active --quiet volto &&
-      sockets=$(ss -H -6 -lunpe "sport = :$port") &&
-      grep -Eq '"volto".*v6only:0([[:space:]]|$)' <<<"$sockets"; then
+  if systemctl restart volto && sleep 3 && systemctl is-active --quiet volto; then
+    if (( want_v6 == 1 )); then
+      if ! sockets=$(ss -H -6 -lunpe "sport = :$port") ||
+         ! grep -Eq '"volto".*v6only:0([[:space:]]|$)' <<<"$sockets"; then
+        return 1
+      fi
+    fi
     replacing=false
-    printf 'Volto 双栈监听已启用（IPv4 和 IPv6，UDP %s）。\n' "$port"
+    created_ech=false
+    if (( want_v6 == 1 )); then
+      printf 'Volto 双栈监听已启用（IPv4 和 IPv6，UDP %s，initial_mtu=1200）。\n' "$port"
+    fi
+    if (( want_sni == 1 )); then
+      printf 'Volto SNI Gate 已启用: expected_sni = ["%s"]。\n' "$sni_name"
+    fi
+    if (( want_ech == 1 )); then
+      printf 'Volto ECH 已启用: require_ech = true（外部 public_name=%s，密钥=%s）。\n' "$pub_name" "$ech_cfg_path"
+      printf '请在 Surge 节点行追加以下参数（无此参数握手将被静默丢弃）:\n'
+      printf '  ech-config=%s\n' "$ech_config_list"
+    fi
     return 0
   fi
 
@@ -208,17 +456,73 @@ enable_dual_stack() (
 )
 
 update_only=false
+help_only=false
+no_ech=false
+[[ ${VOLTO_NO_ECH:-0} == 1 ]] && no_ech=true
+ech_public_name=${ECH_PUBLIC_NAME:-}
+requested_sni=${SNI:-}
+
 if [[ ${1:-} == update ]]; then
   update_only=true
   shift
   check_update_options "$@"
   check_config_for_update "找不到 Volto 配置 ${config}。请先运行安装命令。"
 elif [[ ${1:-} == --help || ${1:-} == -h ]]; then
-  printf '%s\n\n' '已安装的 Volto 可用 sudo bash volto-onekey.sh update 升级。'
-elif should_prompt_for_port "$@"; then
-  selected_port=$(choose_port)
-  printf 'Volto 将使用 UDP %s。\n' "$selected_port" >&2
-  set -- "$@" --port "$selected_port"
+  help_only=true
+  cat <<'HELP'
+已安装的 Volto 可用 sudo bash volto-onekey.sh update 升级。
+
+额外加固选项（仅首次安装生效，默认全部开启）:
+  --no-ech                     不启用 ECH / require_ech（兼容 Apple NERelay 客户端）
+  --ech-public-name <NAME>     自定义 ECH 外部明文域名（默认 cloudflare-ech.com）
+
+默认首次安装还会自动:
+  - 将 net.core.rmem_max / wmem_max 调优至 >= 4 MB（不降低原更高值）
+  - 开启 [security] expected_sni = ["<证书SNI>"]
+  - 生成 /etc/volto/ech.pem 并开启 ech_key + require_ech = true
+  - 有全局 IPv6 且支持双栈时切换 [::] 并将 initial_mtu 调整为 1200
+
+HELP
+else
+  # Strip wrapper-only options before invoking upstream deploy.sh, and capture --sni.
+  upstream_args=()
+  while (( $# )); do
+    case $1 in
+      --no-ech)
+        no_ech=true
+        shift
+        ;;
+      --ech-public-name)
+        if [[ $# -lt 2 || -z $2 || $2 == -* ]]; then
+          printf '%s\n' '请为 --ech-public-name 指定域名，例如 cloudflare-ech.com。' >&2
+          exit 1
+        fi
+        ech_public_name="$2"
+        shift 2
+        ;;
+      -s|--sni)
+        if [[ $# -ge 2 ]]; then
+          requested_sni="$2"
+          upstream_args+=("$1" "$2")
+          shift 2
+        else
+          upstream_args+=("$1")
+          shift
+        fi
+        ;;
+      *)
+        upstream_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  set -- "${upstream_args[@]}"
+
+  if should_prompt_for_port "$@"; then
+    selected_port=$(choose_port)
+    printf 'Volto 将使用 UDP %s。\n' "$selected_port" >&2
+    set -- "$@" --port "$selected_port"
+  fi
 fi
 
 need_cmd curl
@@ -245,8 +549,9 @@ if [[ $update_only == true ]]; then
 fi
 
 first_install=false
-if [[ ! -e $config && ! -L $config ]]; then
+if [[ $help_only != true && ! -e $config && ! -L $config ]]; then
   first_install=true
+  ensure_udp_buffers
 fi
 
 # Run from the verified on-disk file so --enable-timer works even when already
@@ -254,5 +559,5 @@ fi
 # keep stdout attached to the terminal so the Surge password can be displayed.
 bash "$installer" "$@" </dev/null
 if [[ $first_install == true && -f $config ]]; then
-  enable_dual_stack
+  configure_fresh_install
 fi
